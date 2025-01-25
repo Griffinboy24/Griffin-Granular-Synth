@@ -806,7 +806,8 @@ namespace project
         // Normal (non-punchy) scheduling => uses the node's normalEnvelopeFn
         static void scheduleGrainNormal(
             bool& /*unusedFirstGrainFlag*/,
-            std::array<Grain, 12>& grainPool,
+            std::array<Grain, 1>& /*punchyGrainPool*/,
+            std::array<Grain, 11>& normalGrainPool,
             double grainDuration,
             double baseDelta,
             const std::array<const float*, 2>& sample,
@@ -818,7 +819,7 @@ namespace project
             EnvelopeFunction normalEnvelopeFn,
             EnvelopeFunction /*punchyEnvelopeFn*/)
         {
-            for (auto& g : grainPool)
+            for (auto& g : normalGrainPool)
             {
                 if (!g.isActive())
                 {
@@ -837,7 +838,8 @@ namespace project
         // Punchy scheduling => first grain is punchy, subsequent are normal
         static void scheduleGrainPunchy(
             bool& firstGrainScheduled,
-            std::array<Grain, 12>& grainPool,
+            std::array<Grain, 1>& punchyGrainPool,
+            std::array<Grain, 11>& normalGrainPool,
             double grainDuration,
             double baseDelta,
             const std::array<const float*, 2>& sample,
@@ -849,11 +851,11 @@ namespace project
             EnvelopeFunction normalEnvelopeFn,
             EnvelopeFunction punchyEnvelopeFn)
         {
-            for (auto& g : grainPool)
+            if (!firstGrainScheduled)
             {
-                if (!g.isActive())
+                for (auto& g : punchyGrainPool)
                 {
-                    if (!firstGrainScheduled)
+                    if (!g.isActive())
                     {
                         g.activateEnvelope(punchyEnvelopeFn,
                             grainDuration,
@@ -863,8 +865,15 @@ namespace project
                             essence,
                             bufferLen);
                         firstGrainScheduled = true;
+                        break;
                     }
-                    else
+                }
+            }
+            else
+            {
+                for (auto& g : normalGrainPool)
+                {
+                    if (!g.isActive())
                     {
                         g.activateEnvelope(normalEnvelopeFn,
                             grainDuration,
@@ -873,15 +882,16 @@ namespace project
                             grainAmp,
                             essence,
                             bufferLen);
+                        break;
                     }
-                    break;
                 }
             }
         }
     };
 
     using ScheduleGrainFunction = void(*)(bool&,
-        std::array<Grain, 12>&,
+        std::array<Grain, 1>&, // punchyGrainPool
+        std::array<Grain, 11>&, // normalGrainPool
         double, double,
         const std::array<const float*, 2>&,
         float,
@@ -922,7 +932,8 @@ namespace project
             bool  isActive = false;
             float velocity = 1.0f;
 
-            std::array<Grain, 12> grainPool;
+            std::array<Grain, 1> punchyGrainPool;  // Separate Punchy Grain Pool
+            std::array<Grain, 11> normalGrainPool; // Separate Normal Grain Pool
 
             int    grainSchedulerCounter = 0;
             double grainSchedulerInterval = 0.0;
@@ -938,7 +949,9 @@ namespace project
                 isActive = true;
 
                 firstGrainScheduled = false;
-                for (auto& gr : grainPool)
+                for (auto& gr : punchyGrainPool)
+                    gr.active = false;
+                for (auto& gr : normalGrainPool)
                     gr.active = false;
 
                 grainSchedulerCounter = 0;
@@ -994,7 +1007,7 @@ namespace project
         // The function pointers we need:
         EnvelopeFunction   normalEnvelopeFn = &vectorSynthesizeParabolic;
         EnvelopeFunction   punchyEnvelopeFn = &vectorSynthesizePunchyParabolic;
-        ScheduleGrainFunction scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainNormal;
+        ScheduleGrainFunction scheduleGrainFn = nullptr; // Will be set based on punchyMode
 
         //----------------------------------------------------------------------
         // reflectOffset
@@ -1022,6 +1035,12 @@ namespace project
 
             std::random_device rd;
             randomGen.seed(rd());
+
+            // Initialize scheduling function based on punchyMode
+            if (punchyMode)
+                scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainPunchy;
+            else
+                scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainNormal;
         }
 
         //----------------------------------------------------------------------
@@ -1134,7 +1153,7 @@ namespace project
             {
                 int minBlockSize = remaining;
 
-                // figure out how many samples until next scheduling or a grain finishes
+                // Figure out how many samples until next scheduling or a grain finishes
                 for (auto& voice : voices)
                 {
                     if (!voice.isActive)
@@ -1142,12 +1161,23 @@ namespace project
 
                     minBlockSize = std::min(minBlockSize, voice.grainSchedulerCounter);
 
-                    for (auto& grain : voice.grainPool)
+                    // Check remaining samples in normal grains
+                    for (auto& grain : voice.normalGrainPool)
                     {
                         if (grain.isActive())
                         {
-                            // We can do a rough guess at how many remain in that grain,
-                            // but we rely on the envelope state anyway
+                            // Rough estimate of remaining samples
+                            int approxRem = (int)(grain.duration - grain.position);
+                            if (approxRem > 0 && approxRem < minBlockSize)
+                                minBlockSize = approxRem;
+                        }
+                    }
+
+                    // Check remaining samples in punchy grains
+                    for (auto& grain : voice.punchyGrainPool)
+                    {
+                        if (grain.isActive())
+                        {
                             int approxRem = (int)(grain.duration - grain.position);
                             if (approxRem > 0 && approxRem < minBlockSize)
                                 minBlockSize = approxRem;
@@ -1163,13 +1193,25 @@ namespace project
                 std::fill(blockOutL, blockOutL + minBlockSize, 0.f);
                 std::fill(blockOutR, blockOutR + minBlockSize, 0.f);
 
-                // Render each active grain
+                // Render all active grains (both punchy and normal) without conditionals
                 for (auto& voice : voices)
                 {
                     if (!voice.isActive)
                         continue;
 
-                    for (auto& grain : voice.grainPool)
+                    // Render punchy grains
+                    for (auto& grain : voice.punchyGrainPool)
+                    {
+                        if (grain.isActive())
+                        {
+                            int n = grain.vectorSynthesize(blockOutL, blockOutR,
+                                minBlockSize, sampleLen);
+                            grain.position += n;
+                        }
+                    }
+
+                    // Render normal grains
+                    for (auto& grain : voice.normalGrainPool)
                     {
                         if (grain.isActive())
                         {
@@ -1190,7 +1232,7 @@ namespace project
                 globalOffset += minBlockSize;
                 remaining -= minBlockSize;
 
-                // scheduling logic
+                // Scheduling logic
                 for (auto& voice : voices)
                 {
                     if (!voice.isActive)
@@ -1269,10 +1311,11 @@ namespace project
 
                         float grainAmp = voice.velocity;
 
-                        // schedule the new grain
+                        // Schedule the new grain without conditionals in the processing loop
                         scheduleGrainFn(
                             voice.firstGrainScheduled,
-                            voice.grainPool,
+                            voice.punchyGrainPool,
+                            voice.normalGrainPool,
                             grainDuration,
                             baseDelta,
                             sample,
@@ -1370,20 +1413,25 @@ namespace project
             else if constexpr (P == 12)
             {
                 // Spray Mode
-                grainSprayMode = (v >= 0.5) ? 1.0f : 0.0f;
+                grainSprayMode = (v >= 0.5f) ? 1.0f : 0.0f;
             }
             else if constexpr (P == 13)
             {
                 // Punchy Mode
+                bool oldPunchyMode = punchyMode;
                 punchyMode = (v >= 0.5);
-                if (punchyMode)
-                    scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainPunchy;
-                else
-                    scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainNormal;
+                if (oldPunchyMode != punchyMode)
+                {
+                    // Update the scheduling function pointer when punchyMode changes
+                    if (punchyMode)
+                        scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainPunchy;
+                    else
+                        scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainNormal;
+                }
             }
             else if constexpr (P == 14)
             {
-                // Envelope type: 0=Parabolic, 1=Triangle
+                // Envelope Type: 0=Parabolic, 1=Triangle
                 useTriangleEnvelope = (v >= 0.5);
                 if (useTriangleEnvelope)
                 {
