@@ -27,6 +27,7 @@ namespace project
     {
         Parabolic,
         Triangle,
+        ASR // new
         // We'll treat Punchy as a mod on top of these shapes
     };
 
@@ -319,6 +320,142 @@ namespace project
         }
     };
 
+    //---------------------------------------------------------------
+// Envelope state for ASR
+//---------------------------------------------------------------
+    struct ASREnvelopeState
+    {
+        float amplitude = 0.0f;
+        float slope = 0.0f;
+        bool  finished = false;
+        bool  isPunchy = false;
+        int   segmentIndex = 0;
+
+        int   totalSamples = 0;
+        int   samplesDone = 0;
+        int   nextBoundary = 0;
+
+        float grainAmp = 0.0f; // store the final amplitude
+        float attackRatio = 3.f;
+        float sustainRatio = 10.f;
+        float releaseRatio = 11.f;
+
+
+        void initNormal(float gA, int durSamples)
+        {
+            finished = false;
+            isPunchy = false;
+            segmentIndex = 0;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            grainAmp = gA;
+
+            if (durSamples < 2)
+            {
+                amplitude = 0.f; slope = 0.f; finished = true;
+                return;
+            }
+
+
+            // attack
+            int attackSamples = (int)std::round((float)durSamples * attackRatio / (attackRatio + sustainRatio + releaseRatio));
+            if (attackSamples < 1) attackSamples = 1;
+
+            amplitude = 0.f;
+            slope = gA / (float)attackSamples;
+            nextBoundary = attackSamples;
+
+        }
+
+        void initPunchy(float gA, int durSamples)
+        {
+            finished = false;
+            isPunchy = true;
+            segmentIndex = 0;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            grainAmp = gA;
+
+            if (durSamples < 2)
+            {
+                amplitude = 0.f; slope = 0.f; finished = true;
+                return;
+            }
+
+            // punchy has only A and R: no S
+            int attackSamples = (int)std::round((float)durSamples * attackRatio / (attackRatio + releaseRatio));
+            if (attackSamples < 1) attackSamples = 1;
+
+            amplitude = 0.f;
+            slope = gA / (float)attackSamples;
+            nextBoundary = attackSamples;
+
+        }
+
+        void advanceSegment()
+        {
+            if (!isPunchy)
+            {
+                // normal triangle => if segmentIndex=0 => switch to 1 => slope negative
+                if (segmentIndex == 0)
+                {
+                    segmentIndex = 1;
+                    int sustainSamples = (int)std::round((float)totalSamples * sustainRatio / (attackRatio + sustainRatio + releaseRatio));
+                    if (sustainSamples < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
+                    amplitude = grainAmp;
+                    slope = 0.0f;
+                    nextBoundary = sustainSamples;
+
+                }
+                else if (segmentIndex == 1)
+                {
+                    segmentIndex = 2;
+
+                    int releaseSamples = totalSamples - (int)std::round((float)totalSamples * (attackRatio + sustainRatio) / (attackRatio + sustainRatio + releaseRatio));
+                    if (releaseSamples < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
+                    amplitude = grainAmp;
+                    slope = (0.f - grainAmp) / (float)releaseSamples;
+                    nextBoundary = releaseSamples;
+                }
+                else
+                {
+                    finished = true;
+                }
+            }
+            else
+            {
+                // punchy => if segmentIndex=0 => next is a ramp gA->0
+                if (segmentIndex == 0)
+                {
+                    segmentIndex = 1;
+
+                    int releaseSamples = totalSamples - (int)std::round((float)totalSamples * attackRatio / (attackRatio + releaseRatio));
+                    if (releaseSamples < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
+                    // amplitude is already = gA
+                    amplitude = grainAmp;
+                    slope = (0.f - amplitude) / (float)releaseSamples;
+                    nextBoundary = releaseSamples;
+                }
+                else
+                {
+                    finished = true;
+                }
+            }
+        }
+    };
+
     //==============================================================================
     // Rendering functions for each envelope mode
     //==============================================================================
@@ -350,6 +487,19 @@ namespace project
     static int vectorSynthesizePunchyTriangle(Grain& grain,
         float* outL, float* outR,
         int blockSize, int bufferLength);
+    //--------------------------------------------------------------------------
+    // 5) Normal ASR
+    //--------------------------------------------------------------------------
+    static int vectorSynthesizeASR(Grain& grain,
+        float* outL, float* outR,
+        int blockSize, int bufferLength);
+
+    //--------------------------------------------------------------------------
+// 6) Punchy ASR
+//--------------------------------------------------------------------------
+    static int vectorSynthesizePunchyASR(Grain& grain,
+        float* outL, float* outR,
+        int blockSize, int bufferLength);
 
     // A typedef for convenience
     using EnvelopeFunction = int(*)(Grain&, float*, float*, int, int);
@@ -378,6 +528,7 @@ namespace project
         // Envelope states:
         ParabolicEnvelopeState  parabState;
         LinearEnvelopeState     linearState;
+        ASREnvelopeState        asrState;
 
         //--------------------------------------------------------------------------
         // A general "activateEnvelope" that sets up everything
@@ -436,9 +587,17 @@ namespace project
             {
                 linearState.initNormal(grainAmplitude, durSamples);
             }
-            else // punchy triangle
+            else if (fn == &vectorSynthesizePunchyTriangle)
             {
                 linearState.initPunchy(grainAmplitude, durSamples);
+            }
+            else if (fn == &vectorSynthesizeASR)
+            {
+                asrState.initNormal(grainAmplitude, durSamples);
+            }
+            else // punchy ASR
+            {
+                asrState.initPunchy(grainAmplitude, durSamples);
             }
         }
 
@@ -800,6 +959,170 @@ namespace project
         return processed;
     }
 
+    //------------------------------------------------------------------------------
+ // 5) Normal ASR
+ //------------------------------------------------------------------------------
+    static int vectorSynthesizeASR(Grain& grain,
+        float* outL, float* outR,
+        int blockSize, int bufferLength)
+    {
+        auto& st = grain.asrState;
+        if (st.finished || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+
+        int processed = 0;
+        int remain = blockSize;
+
+        const float srl = (float)grain.sourceReadLength;
+        const float startOff = grain.essence.startOffsetInSamples;
+        const float pan = grain.essence.panning;
+        const float leftGain = 0.5f * (1.0f - pan);
+        const float rightGain = 0.5f * (1.0f + pan);
+
+        const float* srcL = grain.sourceL;
+        const float* srcR = grain.sourceR;
+
+        while (remain > 0 && !st.finished)
+        {
+            int boundary = std::min(remain, st.nextBoundary);
+
+            for (int i = 0; i < boundary; ++i)
+            {
+                float env = st.amplitude;
+                st.amplitude += st.slope;
+
+                float x = 0.f;
+                if (st.totalSamples > 1)
+                    x = (float)st.samplesDone / (float)st.totalSamples;
+
+                float effPos = x * srl + startOff;
+                float sampleL = 0.f, sampleR = 0.f;
+                if (effPos >= 0.f)
+                {
+                    int idx0 = (int)effPos;
+                    if (idx0 >= bufferLength) break;
+                    int idx1 = std::min(idx0 + 1, bufferLength - 1);
+                    float frac = effPos - (float)idx0;
+
+                    sampleL = srcL[idx0] + frac * (srcL[idx1] - srcL[idx0]);
+                    sampleR = srcR[idx0] + frac * (srcR[idx1] - srcR[idx0]);
+                }
+
+                sampleL *= (env * leftGain);
+                sampleR *= (env * rightGain);
+
+                outL[processed + i] += sampleL;
+                outR[processed + i] += sampleR;
+
+                st.samplesDone++;
+                if (st.samplesDone >= st.totalSamples)
+                {
+                    st.finished = true;
+                    break;
+                }
+            }
+
+            remain -= boundary;
+            processed += boundary;
+            st.nextBoundary -= boundary;
+
+            if (st.nextBoundary <= 0 && !st.finished)
+                st.advanceSegment();
+        }
+
+        if (st.finished)
+            grain.active = false;
+
+        return processed;
+    }
+
+    //------------------------------------------------------------------------------
+    // 6) Punchy ASR
+    //------------------------------------------------------------------------------
+    static int vectorSynthesizePunchyASR(Grain& grain,
+        float* outL, float* outR,
+        int blockSize, int bufferLength)
+    {
+        auto& st = grain.asrState;
+        if (st.finished || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+
+        int processed = 0;
+        int remain = blockSize;
+
+        const float srl = (float)grain.sourceReadLength;
+        const float startOff = grain.essence.startOffsetInSamples;
+        const float pan = grain.essence.panning;
+        const float leftGain = 0.5f * (1.0f - pan);
+        const float rightGain = 0.5f * (1.0f + pan);
+
+        const float* srcL = grain.sourceL;
+        const float* srcR = grain.sourceR;
+
+        while (remain > 0 && !st.finished)
+        {
+            int boundary = std::min(remain, st.nextBoundary);
+
+            for (int i = 0; i < boundary; ++i)
+            {
+                float env = st.amplitude;
+
+                // if segmentIndex=1 => do slope
+                if (st.segmentIndex == 1)
+                    st.amplitude += st.slope;
+
+
+                float x = 0.f;
+                if (st.totalSamples > 1)
+                    x = (float)st.samplesDone / (float)st.totalSamples;
+
+                float effPos = x * srl + startOff;
+                float sampleL = 0.f, sampleR = 0.f;
+                if (effPos >= 0.f)
+                {
+                    int idx0 = (int)effPos;
+                    if (idx0 >= bufferLength) break;
+                    int idx1 = std::min(idx0 + 1, bufferLength - 1);
+                    float frac = effPos - (float)idx0;
+
+                    sampleL = srcL[idx0] + frac * (srcL[idx1] - srcL[idx0]);
+                    sampleR = srcR[idx0] + frac * (srcR[idx1] - srcR[idx0]);
+                }
+
+                sampleL *= (env * leftGain);
+                sampleR *= (env * rightGain);
+
+                outL[processed + i] += sampleL;
+                outR[processed + i] += sampleR;
+
+                st.samplesDone++;
+                if (st.samplesDone >= st.totalSamples)
+                {
+                    st.finished = true;
+                    break;
+                }
+            }
+
+            remain -= boundary;
+            processed += boundary;
+            st.nextBoundary -= boundary;
+
+            if (st.nextBoundary <= 0 && !st.finished)
+                st.advanceSegment();
+        }
+
+        if (st.finished)
+            grain.active = false;
+
+        return processed;
+    }
+
     //==============================================================================
     // Scheduling functions
     //==============================================================================
@@ -1010,7 +1333,7 @@ namespace project
         bool punchyMode = false;
 
         // Which normal envelope shape do we use: parabolic or triangle?
-        bool useTriangleEnvelope = false;
+        int envelopeType = 0; // 0=Parabolic, 1=Triangle, 2 = ASR
 
         // The function pointers we need:
         EnvelopeFunction   normalEnvelopeFn = &vectorSynthesizeParabolic;
@@ -1049,6 +1372,7 @@ namespace project
                 scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainPunchy;
             else
                 scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainNormal;
+            updateEnvelopeFunctions();
         }
 
         //----------------------------------------------------------------------
@@ -1070,6 +1394,26 @@ namespace project
 
             raisedCosAttackSamples = (int)std::lround(0.02 * sampleRate);
             raisedCosReleaseSamples = (int)std::lround(0.02 * sampleRate);
+        }
+
+        void updateEnvelopeFunctions()
+        {
+            if (envelopeType == 0)
+            {
+                normalEnvelopeFn = &vectorSynthesizeParabolic;
+                punchyEnvelopeFn = &vectorSynthesizePunchyParabolic;
+            }
+            else if (envelopeType == 1)
+            {
+                normalEnvelopeFn = &vectorSynthesizeTriangle;
+                punchyEnvelopeFn = &vectorSynthesizePunchyTriangle;
+            }
+            else // ASR
+            {
+                normalEnvelopeFn = &vectorSynthesizeASR;
+                punchyEnvelopeFn = &vectorSynthesizePunchyASR;
+            }
+
         }
 
         //----------------------------------------------------------------------
@@ -1452,18 +1796,9 @@ namespace project
             }
             else if constexpr (P == 14)
             {
-                // Envelope Type: 0=Parabolic, 1=Triangle
-                useTriangleEnvelope = (v >= 0.5);
-                if (useTriangleEnvelope)
-                {
-                    normalEnvelopeFn = &vectorSynthesizeTriangle;
-                    punchyEnvelopeFn = &vectorSynthesizePunchyTriangle;
-                }
-                else
-                {
-                    normalEnvelopeFn = &vectorSynthesizeParabolic;
-                    punchyEnvelopeFn = &vectorSynthesizePunchyParabolic;
-                }
+                // Envelope Type: 0=Parabolic, 1=Triangle, 2=ASR
+                envelopeType = (int)std::round(v * 2.0f);
+                updateEnvelopeFunctions();
             }
         }
 
@@ -1555,8 +1890,8 @@ namespace project
                 data.add(std::move(punchyParam));
             }
             {
-                // Envelope Type: 0=Parabolic, 1=Triangle
-                parameter::data envTypeParam("Envelope Type", { 0.0, 1.0, 1.0 });
+                // Envelope Type: 0=Parabolic, 1=Triangle, 2=ASR
+                parameter::data envTypeParam("Envelope Type", { 0.0, 1.0, 0.5f });
                 registerCallback<14>(envTypeParam);
                 envTypeParam.setDefaultValue(0.0);
                 data.add(std::move(envTypeParam));
