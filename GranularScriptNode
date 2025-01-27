@@ -407,6 +407,7 @@ namespace project
             essence = e;
 
             // Bound check so we don't read outside sample
+            /*
             double endPos = essence.startOffsetInSamples + sourceReadLength;
             if (endPos > (double)bufferLength)
             {
@@ -415,6 +416,7 @@ namespace project
                 if (essence.startOffsetInSamples < 0.0f)
                     essence.startOffsetInSamples = 0.0f;
             }
+            */
 
             envelopeRenderFn = fn;
 
@@ -942,6 +944,9 @@ namespace project
             // For punchy mode: only the first grain is "punchy"
             bool firstGrainScheduled = false;
 
+            //  scanDirection for bidirectional scanning
+            double scanDirection = 1.0; // 1.0 for forward, -1.0 for backward
+
             void reset(int note, float vel, int /*grainSizeSamples*/, int grainIntervalSamples)
             {
                 midiNote = note;
@@ -957,6 +962,9 @@ namespace project
                 grainSchedulerCounter = 0;
                 grainSchedulerInterval = (double)grainIntervalSamples;
                 modPhase = 0.0;
+
+                // Initialize scanDirection to forward
+                scanDirection = 1.0;
             }
         };
 
@@ -1273,16 +1281,29 @@ namespace project
                                 double cycleTime = startModTimeSec;
                                 double increment = timeSec / cycleTime;
 
-                                voice.modPhase += increment;
-                                voice.modPhase = std::fmod(voice.modPhase, 1.0);
+                                // Update modPhase with bidirectional scanning
+                                voice.modPhase += increment * voice.scanDirection;
+
+                                if (voice.modPhase >= 1.0)
+                                {
+                                    voice.modPhase = 2.0 - voice.modPhase;
+                                    voice.scanDirection = -1.0;
+                                }
+                                else if (voice.modPhase <= 0.0)
+                                {
+                                    voice.modPhase = -voice.modPhase;
+                                    voice.scanDirection = 1.0;
+                                }
+
+                                float curPercent = (float)voice.modPhase;
 
                                 float base = grainStartPercent;
-                                float frac = (float)voice.modPhase;
-                                float curPercent = base + frac * (1.0f - base);
+                                // You can adjust how curPercent interacts with grainStartPercent if needed
+                                // For a simple bidirectional scan, curPercent directly maps to playhead position
+                                // float curPercent = base + frac * (1.0f - base);
 
-                                int sampleLenLocal = sampleLen;
-                                if (sampleLenLocal < 1) sampleLenLocal = 1;
-                                finalStartOffset = curPercent * (float)(sampleLenLocal - 1);
+                                // Calculate finalStartOffset based on curPercent
+                                finalStartOffset = curPercent * (float)(sampleLen - 1);
                             }
 
                             if (grainSpray > 0.0f)
