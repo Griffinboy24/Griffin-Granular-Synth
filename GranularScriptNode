@@ -146,9 +146,9 @@ namespace project
             int half = durSamples / 2;
             if (half < 1) half = 1;
 
-            amplitude = gA;
-            slope = 0.0f;
-            curve = 0.0f;
+            amplitude = gA;         // **Set amplitude to gA immediately**
+            slope = 0.0f;            // **No slope; hold amplitude**
+            curve = 0.0f;            // **No curve**
             nextBoundary = half;
         }
 
@@ -321,8 +321,8 @@ namespace project
     };
 
     //---------------------------------------------------------------
-// Envelope state for ASR
-//---------------------------------------------------------------
+    // Envelope state for ASR
+    //---------------------------------------------------------------
     struct ASREnvelopeState
     {
         float amplitude = 0.0f;
@@ -386,10 +386,10 @@ namespace project
             int attackSamples = (int)std::round((float)durSamples * attackRatio / (attackRatio + releaseRatio));
             if (attackSamples < 1) attackSamples = 1;
 
-            amplitude = 0.f;
-            slope = gA / (float)attackSamples;
-            nextBoundary = attackSamples;
-
+            // **Initialize amplitude to gA and slope to 0 for punchy attack**
+            amplitude = gA;               // **Set amplitude to gA immediately**
+            slope = 0.f;                  // **No slope; hold amplitude**
+            nextBoundary = attackSamples; // **Set boundary to attackSamples**
         }
 
         void advanceSegment()
@@ -452,7 +452,7 @@ namespace project
                 }
             }
         }
-	};
+    };
 
     //==============================================================================
     // Rendering functions for each envelope mode
@@ -493,8 +493,8 @@ namespace project
         int blockSize, int bufferLength);
 
     //--------------------------------------------------------------------------
-// 6) Punchy ASR
-//--------------------------------------------------------------------------
+    // 6) Punchy ASR
+    //--------------------------------------------------------------------------
     static int vectorSynthesizePunchyASR(Grain& grain,
         float* outL, float* outR,
         int blockSize, int bufferLength);
@@ -958,8 +958,8 @@ namespace project
     }
 
     //------------------------------------------------------------------------------
- // 5) Normal ASR
- //------------------------------------------------------------------------------
+    // 5) Normal ASR
+    //------------------------------------------------------------------------------
     static int vectorSynthesizeASR(Grain& grain,
         float* outL, float* outR,
         int blockSize, int bufferLength)
@@ -1540,6 +1540,7 @@ namespace project
 
                 float* blockOutL = tempBlockOutL.data();
                 float* blockOutR = tempBlockOutR.data();
+
                 std::fill(blockOutL, blockOutL + minBlockSize, 0.f);
                 std::fill(blockOutR, blockOutR + minBlockSize, 0.f);
 
@@ -1608,8 +1609,7 @@ namespace project
                             std::uniform_real_distribution<float> panDist(-grainPanRange, grainPanRange);
                             essence.panning = panDist(randomGen);
 
-                            int maxGapSamples = (int)std::lround(grainGapAdjustmentMaxSec * sampleRate);
-                            std::uniform_int_distribution<int> gapDist(0, maxGapSamples);
+                            std::uniform_int_distribution<int> gapDist(0, (int)std::lround(grainGapAdjustmentMaxSec * sampleRate));
                             essence.gapAdjustment = gapDist(randomGen);
 
                             std::uniform_real_distribution<float> sizeDist(1.0f - grainSizeRandom, 1.0f);
