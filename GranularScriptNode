@@ -117,7 +117,7 @@ namespace project
             nextBoundary = half;
         }
 
-        void advanceSegment()
+        inline void advanceSegment()
         {
             if (!isPunchy)
             {
@@ -210,7 +210,7 @@ namespace project
             nextBoundary = half;
         }
 
-        void advanceSegment()
+        inline void advanceSegment()
         {
             if (!isPunchy)
             {
@@ -324,7 +324,7 @@ namespace project
             nextBoundary = attackSamples;
         }
 
-        void advanceSegment()
+        inline void advanceSegment()
         {
             if (!isPunchy)
             {
@@ -385,7 +385,6 @@ namespace project
     //==============================================================================
     // Forward Declarations for Envelope Rendering Functions
     //==============================================================================
-
     static int vectorSynthesizeParabolic(struct Grain& grain,
         float* outL, float* outR,
         int blockSize, int bufferLength);
@@ -413,7 +412,6 @@ namespace project
     //==============================================================================
     // Grain struct
     //==============================================================================
-
     struct Grain
     {
         const float* sourceL = nullptr;
@@ -1041,7 +1039,6 @@ namespace project
     //==============================================================================
     // Scheduling Functions
     //==============================================================================
-
     struct Granular_Synth_2_Helper
     {
         static void scheduleGrainNormal(
@@ -1144,7 +1141,6 @@ namespace project
     //==============================================================================
     // Granular_Synth_2 Class Template
     //==============================================================================
-
     template <int NV>
     struct Granular_Synth_2 : public data::base
     {
@@ -1203,6 +1199,7 @@ namespace project
 
         std::array<float, 128> pitchRatios{};
         double sampleRate = 44100.0;
+        // Now sampleRateRatio is computed from the file sample rate (stored in sampleData.sampleRate)
         double sampleRateRatio = 1.0;
         int    grainSizeInSamples = 0;
         int    grainIntervalInSamples = 0;
@@ -1240,16 +1237,36 @@ namespace project
         std::vector<float> tempBlockOutL;
         std::vector<float> tempBlockOutR;
 
-        static float reflectOffset(float offset, float bufferLen)
+        // Optimized reflection function.
+        // This function assumes that in the common case, the offset is within one double-length (2*bufferLen).
+        // If not, we fall back to std::fmod.
+        inline static float reflectOffset(float offset, float bufferLen)
         {
-            float doubleLen = 2.0f * bufferLen;
-            offset = std::fmod(offset, doubleLen);
-            if (offset < 0.0f)
-                offset += doubleLen;
+            const float doubleLen = 2.0f * bufferLen;
+
+            // Fast-path: if offset is already in the range [-doubleLen, doubleLen]
+            if (offset > -doubleLen && offset < doubleLen)
+            {
+                // Make sure offset is non-negative.
+                if (offset < 0.0f)
+                    offset += doubleLen;
+            }
+            else
+            {
+                // Fall back to modulo for out-of-range values.
+                offset = std::fmod(offset, doubleLen);
+                if (offset < 0.0f)
+                    offset += doubleLen;
+            }
+
+            // Reflect if offset exceeds bufferLen.
+            // (For values between bufferLen and doubleLen, we map them back down.)
             if (offset > bufferLen)
                 offset = doubleLen - offset;
+
             return offset;
         }
+
 
         void prepare(PrepareSpecs specs)
         {
@@ -1272,7 +1289,8 @@ namespace project
         {
             grainSizeInSamples = (int)std::lround((grainSizeMS / 1000.0) * sampleRate);
             grainIntervalInSamples = (int)std::lround((grainIntervalMS / 1000.0) * sampleRate);
-            sampleRateRatio = 44100.0 / sampleRate;
+            // Use the sample's file sample rate from ExternalData (if available) instead of 44100
+            sampleRateRatio = (sampleData.sampleRate > 0 ? sampleData.sampleRate : 44100.0) / sampleRate;
             globalPitchOffsetFactor = std::pow(2.0, grainPitchOffsetSemitones / 12.0);
             int currentSampleLength = sampleBuffer.getNumSamples();
             if (currentSampleLength < 1)
