@@ -32,8 +32,8 @@ namespace project
     }
 
     //==============================================================================
-     // GrainEssence_2: Randomized per-grain parameters computed on activation.
-     //==============================================================================
+    // GrainEssence_2: Randomized per-grain parameters computed on activation.
+    //==============================================================================
     struct GrainEssence_2
     {
         double pitchOffsetCents = 0.0;
@@ -48,96 +48,52 @@ namespace project
     };
 
     //==============================================================================
-     // ASR envelope state struct (only envelope type kept) -> ASREnvelopeState_2
-     //==============================================================================
-    struct ASREnvelopeState_2
+    // Parabolic envelope state struct (new envelope type)
+    //==============================================================================
+    struct ParabolicEnvelopeState_2
     {
         float amplitude = 0.0f;
         float slope = 0.0f;
+        float curve = 0.0f;
         bool  finished = false;
-        int   segmentIndex = 0;
 
         int   totalSamples = 0;
         int   samplesDone = 0;
+        // Not used for segmentation, but kept for compatibility.
         int   nextBoundary = 0;
-
-        float grainAmp = 0.0f; // final amplitude
-        // Updated ratios: Attack 10%, Sustain 80%, Release 10%
-        float attackRatio = 0.25f;
-        float sustainRatio = 0.5f;
-        float releaseRatio = 0.25f;
 
         void initNormal(float gA, int durSamples)
         {
             finished = false;
-            segmentIndex = 0;
             totalSamples = durSamples;
             samplesDone = 0;
-            grainAmp = gA;
-
-            if (durSamples < 2)
+            if (durSamples < 1)
             {
                 amplitude = 0.f;
                 slope = 0.f;
+                curve = 0.f;
                 finished = true;
                 return;
             }
-
-            int attackSamples = (int)std::round((float)durSamples * attackRatio / (attackRatio + sustainRatio + releaseRatio));
-            if (attackSamples < 1)
-                attackSamples = 1;
             amplitude = 0.f;
-            slope = gA / (float)attackSamples;
-            nextBoundary = attackSamples;
-        }
-
-        inline void advanceSegment()
-        {
-            if (segmentIndex == 0) // Attack -> Sustain
-            {
-                segmentIndex = 1;
-                int sustainSamples = (int)std::round((float)totalSamples * sustainRatio / (attackRatio + sustainRatio + releaseRatio));
-                if (sustainSamples < 1)
-                {
-                    finished = true;
-                    return;
-                }
-                amplitude = grainAmp;
-                slope = 0.0f;
-                nextBoundary = sustainSamples;
-            }
-            else if (segmentIndex == 1) // Sustain -> Release
-            {
-                segmentIndex = 2;
-                int releaseSamples = totalSamples - (int)std::round((float)totalSamples * (attackRatio + sustainRatio) / (attackRatio + sustainRatio + releaseRatio));
-                if (releaseSamples < 1)
-                {
-                    finished = true;
-                    return;
-                }
-                amplitude = grainAmp;
-                slope = (0.f - grainAmp) / (float)releaseSamples;
-                nextBoundary = releaseSamples;
-            }
-            else
-            {
-                finished = true;
-            }
+            double rdur = 1.0 / double(durSamples);
+            double rdur2 = rdur * rdur;
+            slope = float(4.0 * double(gA) * (rdur - rdur2));
+            curve = float(-8.0 * double(gA) * rdur2);
+            nextBoundary = durSamples; // single segment
         }
     };
 
     //==============================================================================
-     // Forward Declaration for Envelope Rendering Function (ASR only)
-     // Renamed from vectorSynthesizeASR to vectorSynthesizeASR_2.
-     // Note: the last parameter “bufferLength” is the length of our circular buffer.
-     //==============================================================================
-    static int vectorSynthesizeASR_2(struct Grain_2& grain,
+    // Forward Declaration for Envelope Rendering Function (Parabolic)
+    //==============================================================================
+    static int vectorSynthesizeParabolic_2(struct Grain_2& grain,
         float* outL, float* outR,
         int blockSize, int bufferLength);
 
     //==============================================================================
-     // Grain_2 struct
-     //==============================================================================
+    // Grain_2 struct
+    //==============================================================================
     struct Grain_2
     {
         // These pointers now point to our circular buffer data.
@@ -155,7 +111,8 @@ namespace project
         using EnvelopeFunction = int(*)(Grain_2&, float*, float*, int, int);
         EnvelopeFunction envelopeRenderFn = nullptr;
 
-        ASREnvelopeState_2 asrState;
+        // Use the new parabolic envelope state.
+        ParabolicEnvelopeState_2 parabolicState;
 
         void activateEnvelope(EnvelopeFunction fn,
             double dur,
@@ -187,7 +144,7 @@ namespace project
             if (durSamples < 1)
                 durSamples = 1;
 
-            asrState.initNormal(grainAmplitude, durSamples);
+            parabolicState.initNormal(grainAmplitude, durSamples);
         }
 
         int vectorSynthesize(float* outL, float* outR, int blockSize, int bufferLength)
@@ -201,15 +158,13 @@ namespace project
     };
 
     //==============================================================================
-     // Envelope Rendering Function (ASR only) -> vectorSynthesizeASR_2
-     // The grain’s starting point (essence.startOffsetInSamples) is used as the base for reading
-     // from the circular buffer. The effective read position is computed and wrapped using bitmasking.
-     //==============================================================================
-    static int vectorSynthesizeASR_2(Grain_2& grain,
+    // Envelope Rendering Function (Parabolic envelope)
+    //==============================================================================
+    static int vectorSynthesizeParabolic_2(Grain_2& grain,
         float* outL, float* outR,
         int blockSize, int bufferLength)
     {
-        auto& st = grain.asrState;
+        auto& st = grain.parabolicState;
         if (st.finished || !grain.active)
         {
             grain.active = false;
@@ -229,9 +184,10 @@ namespace project
 
         float amp = st.amplitude;
         float slope = st.slope;
+        float curve = st.curve;
         int samplesDone = st.samplesDone;
         int totalSamples = st.totalSamples;
-        int localBoundary = st.nextBoundary;
+        int localBoundary = totalSamples - samplesDone; // remaining samples in envelope
         bool finished = st.finished;
 
         while (remain > 0 && !finished)
@@ -241,11 +197,13 @@ namespace project
             {
                 float env = amp;
                 amp += slope;
+                slope += curve;
                 float x = (totalSamples > 1 ? samplesDone * invTotal : 0.f);
-                float effPos = x * srl;
-                // Instead of using modulo, we use bitmasking.
-                int idx0 = ((int)(base + effPos)) & (bufferLength - 1);
-                int idx1 = ((idx0 + 1)) & (bufferLength - 1);
+                // Compute effective read pointer by adding the start offset first.
+                float effPos = base + x * srl;
+                // Use bitmasking to wrap the index.
+                int idx0 = ((int)effPos) & (bufferLength - 1);
+                int idx1 = (idx0 + 1) & (bufferLength - 1);
                 float frac = effPos - std::floor(effPos);
                 float sampleL = srcL[idx0] + frac * (srcL[idx1] - srcL[idx0]);
                 float sampleR = srcR[idx0] + frac * (srcR[idx1] - srcR[idx0]);
@@ -263,26 +221,11 @@ namespace project
             }
             remain -= boundary;
             processed += boundary;
-            localBoundary -= boundary;
-            if (localBoundary <= 0 && !finished)
-            {
-                st.amplitude = amp;
-                st.slope = slope;
-                st.samplesDone = samplesDone;
-                st.nextBoundary = localBoundary;
-                st.advanceSegment();
-                amp = st.amplitude;
-                slope = st.slope;
-                samplesDone = st.samplesDone;
-                totalSamples = st.totalSamples;
-                localBoundary = st.nextBoundary;
-                finished = st.finished;
-            }
+            localBoundary = totalSamples - samplesDone;
         }
         st.amplitude = amp;
         st.slope = slope;
         st.samplesDone = samplesDone;
-        st.nextBoundary = localBoundary;
         st.finished = finished;
         if (finished)
             grain.active = false;
@@ -290,9 +233,9 @@ namespace project
     }
 
     //==============================================================================
-     // Scheduling Functions (only one envelope type available)
-     // Renamed to Granular_Synth_2_Helper_2.
-     //==============================================================================
+    // Scheduling Functions (only one envelope type available)
+    // Renamed to Granular_Synth_2_Helper_2.
+    //==============================================================================
     struct Granular_Synth_2_Helper_2
     {
         static void scheduleGrainNormal_2(
@@ -335,9 +278,9 @@ namespace project
         Grain_2::EnvelopeFunction);
 
     //==============================================================================
-     // Monophonic Granular_Delay_1 Class
-     // (Polyphonic voice handling and external event handling have been removed.)
-     //==============================================================================
+    // Monophonic Granular_Delay_1 Class
+    // (Polyphonic voice handling and external event handling have been removed.)
+    //==============================================================================
     template <int NV>
     struct Granular_Delay_1 : public data::base
     {
@@ -368,6 +311,9 @@ namespace project
 
             int    grainSchedulerCounter = 0;
             double grainSchedulerInterval = 0.0;
+
+            // Added for ping pong panning.
+            bool pingPongToggle = false;
         };
 
         Voice voice;
@@ -391,6 +337,7 @@ namespace project
 
         double grainOffsetCentsRange = 0.0;
         float  grainVolumeMin = 0.8f;
+        // The grainPanRange is no longer used because we use ping pong panning.
         float  grainPanRange = 0.25f;
         double grainGapAdjustmentMaxSec = 0.25;
         float  grainSizeRandom = 0.0f;
@@ -402,8 +349,8 @@ namespace project
         int raisedCosAttackSamples = 0;
         int raisedCosReleaseSamples = 0;
 
-        // Only ASR envelope is available.
-        typename Grain_2::EnvelopeFunction normalEnvelopeFn = &vectorSynthesizeASR_2;
+        // Only Parabolic envelope is available now.
+        typename Grain_2::EnvelopeFunction normalEnvelopeFn = &vectorSynthesizeParabolic_2;
         ScheduleGrainFunction_2 scheduleGrainFn = nullptr;
 
         std::vector<float> tempBlockOutL;
@@ -490,7 +437,7 @@ namespace project
                         normalEnvelopeFn);
                 };
 
-            normalEnvelopeFn = &vectorSynthesizeASR_2;
+            normalEnvelopeFn = &vectorSynthesizeParabolic_2;
         }
 
         void updateDerivedParameters()
@@ -606,8 +553,12 @@ namespace project
                         essence.pitchOffsetCents = pitchOffDist(randomGen);
                         std::uniform_real_distribution<float> volDist(grainVolumeMin, 1.0f);
                         essence.volumeMult = volDist(randomGen);
-                        std::uniform_real_distribution<float> panDist(-grainPanRange, grainPanRange);
-                        essence.panning = panDist(randomGen);
+
+                        // Replace the random pan functionality with ping pong panning:
+                        // Each consecutive grain alternates between hard left (-1.0) and hard right (1.0)
+                        essence.panning = voice.pingPongToggle ? 1.0f : -1.0f;
+                        voice.pingPongToggle = !voice.pingPongToggle;
+
                         std::uniform_int_distribution<int> gapDist(0, (int)std::lround(grainGapAdjustmentMaxSec * sampleRate));
                         essence.gapAdjustment = gapDist(randomGen);
                         std::uniform_real_distribution<float> sizeDist(1.0f - grainSizeRandom, 1.0f);
@@ -673,7 +624,11 @@ namespace project
             }
             else if constexpr (P == 3)
             {
-                grainPanRange = (float)v;
+                // Parameter 3 now controls ping pong mode.
+                // The value is no longer used to generate random panning.
+                // The ping pong mode is always active.
+                // You may use this parameter to enable/disable ping pong if desired.
+                // For now, we ignore the value.
             }
             else if constexpr (P == 4)
             {
@@ -728,7 +683,8 @@ namespace project
                 data.add(std::move(volMinParam));
             }
             {
-                parameter::data panParam("Rand Pan", { 0.0, 1.0, 0.01 });
+                // Changed parameter name from "Rand Pan" to "Ping Pong"
+                parameter::data panParam("Ping Pong", { 0.0, 1.0, 1.0 });
                 registerCallback<3>(panParam);
                 panParam.setDefaultValue(1.0);
                 data.add(std::move(panParam));
@@ -764,7 +720,7 @@ namespace project
                 data.add(std::move(startParam));
             }
             {
-                parameter::data sprayParam("Spray", { 0.0, 1.0, 0.01 });
+                parameter::data sprayParam("Spray", { 0.0, 0.5, 0.001 });
                 registerCallback<11>(sprayParam);
                 sprayParam.setDefaultValue(0.0);
                 data.add(std::move(sprayParam));
