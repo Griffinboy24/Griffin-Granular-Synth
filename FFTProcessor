@@ -7,91 +7,107 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 
 //==============================================================================
 // FFTProcessor
 //
 // This header-only class implements an FFT analysis/resynthesis system using
-// overlap-add processing. The number of frequency bins is fixed based on a 
-// constant FFT size, and a lowpass cutoff frequency in Hz can be specified 
-// independent of the sample rate. The cutoff frequency is converted to a bin index
+// overlap-add processing. The FFT size is fixed (power of 2) so that the number
+// of frequency bins is constant, and a lowpass cutoff frequency (in Hz) is applied
+// by zeroing out bins above the cutoff. The cutoff is converted to a bin index
 // using the current sample rate.
+//
+// Thread safety is ensured via atomic counters. All static data (such as the window
+// coefficients) are precomputed in double precision and then converted to float.
+// No dynamic memory allocation occurs on the realtime audio path.
 //==============================================================================
 class FFTProcessor
 {
 public:
     // FFT configuration constants.
-    static constexpr int fftOrder = 11;           // log2(fftSize), so fftSize = 2048
-    static constexpr int fftSize = 1 << fftOrder;   // 2048 samples per FFT frame
-    static constexpr int numBins = fftSize / 2 + 1; // Number of frequency bins for real FFT
-    static constexpr int overlap = 4;             // 75% overlap (i.e. 4 segments per frame)
-    static constexpr int hopSize = fftSize / overlap; // e.g. 2048/4 = 512 samples per hop
+    static constexpr int fftOrder = 11;           // log2(fftSize); 2048 samples per frame.
+    static constexpr int fftSize = 1 << fftOrder;   // 2048 samples per FFT frame.
+    static constexpr int numBins = fftSize / 2 + 1; // Number of frequency bins.
+    static constexpr int overlap = 4;             // 75% overlap (4 segments per frame).
+    static constexpr int hopSize = fftSize / overlap; // For example, 2048/4 = 512 samples per hop.
 
-    // Gain correction for using the Hann window with 75% overlap.
+    // Gain correction for the Hann window with 75% overlap.
     static constexpr float windowCorrection = 2.0f / 3.0f;
 
-    // Set the current sample rate (in Hz).
+    // Public interface to update parameters.
     inline void setSampleRate(float sr)
     {
         currentSampleRate = sr;
     }
 
-    // Set the lowpass cutoff frequency (in Hz).
     inline void setLowpassCutoff(float freqHz)
     {
         lowpassCutoffFrequency = freqHz;
     }
 
-    // Constructor: initializes the FFT and window. Default sample rate is 44100 Hz,
-    // and the default lowpass cutoff is 5000 Hz.
+    // Constructor: sets default sample rate, lowpass cutoff and precomputes window table.
     FFTProcessor() :
         fft(fftOrder),
-        window(fftSize + 1, juce::dsp::WindowingFunction<float>::hann, false),
         currentSampleRate(44100.0f),
-        lowpassCutoffFrequency(5000.0f)
+        lowpassCutoffFrequency(5000.0f),
+        pos(0),
+        count(0)
     {
+        // Precompute the Hann window using double precision.
+        windowTable.resize(fftSize);
+        for (int i = 0; i < fftSize; ++i)
+        {
+            // Use the Hann formula over [0, fftSize-1] (periodic window)
+            double w = 0.5 * (1.0 - std::cos((2.0 * M_PI * i) / static_cast<double>(fftSize)));
+            windowTable[i] = static_cast<float>(w);
+        }
     }
 
-    // reset() -- Clears internal counters and zeroes the input/output buffers.
+    // reset() -- Clears internal counters and zeroes the input and output buffers.
     inline void reset()
     {
-        count = 0;
-        pos = 0;
+        count.store(0, std::memory_order_relaxed);
+        pos.store(0, std::memory_order_relaxed);
         inputFifo.fill(0.0f);
         outputFifo.fill(0.0f);
     }
 
-    // processSample() -- Processes one sample and returns the corresponding output sample.
-    // If "bypassed" is true, FFT processing is skipped.
+    // processSample() -- Processes one sample and returns the corresponding output.
+    // If bypassed is true, the FFT processing is skipped.
     inline float processSample(float sample, bool bypassed)
     {
-        // Store the incoming sample in the circular input buffer.
-        inputFifo[pos] = sample;
+        // Store incoming sample into circular input buffer.
+        int p = pos.load(std::memory_order_relaxed);
+        inputFifo[p] = sample;
 
-        // Retrieve the corresponding output sample.
-        float outputSample = outputFifo[pos];
+        // Retrieve corresponding output sample.
+        float outputSample = outputFifo[p];
 
-        // Clear the output slot so new overlap-add data can be added.
-        outputFifo[pos] = 0.0f;
+        // Clear output slot for future overlap-add.
+        outputFifo[p] = 0.0f;
 
-        // Update the buffer index using bitmasking (efficient for power-of-2 sizes).
-        pos = (pos + 1) & (fftSize - 1);
+        // Update circular index (bitmasking works because fftSize is power of 2).
+        p = (p + 1) & (fftSize - 1);
+        pos.store(p, std::memory_order_relaxed);
 
-        // Count samples. When we've accumulated hopSize samples, process a frame.
-        count++;
-        if (count == hopSize)
+        // Accumulate samples; when hopSize is reached, process an FFT frame.
+        int c = count.load(std::memory_order_relaxed) + 1;
+        if (c >= hopSize)
         {
-            count = 0;
+            c = 0;
             processFrame(bypassed);
         }
+        count.store(c, std::memory_order_relaxed);
         return outputSample;
     }
 
-    // flushRemaining() -- Process an extra fftSize samples (of zeros) to flush out
-    // any residual data in the buffers. Returns the extra output samples.
+    // flushRemaining() -- Processes an extra fftSize samples (zeros) to flush residuals.
+    // Returns the extra output samples.
     inline std::vector<float> flushRemaining(bool bypassed)
     {
         std::vector<float> flushed;
+        flushed.reserve(fftSize);
         for (int i = 0; i < fftSize; ++i)
         {
             float out = processSample(0.0f, bypassed);
@@ -101,101 +117,93 @@ public:
     }
 
 private:
-    // JUCE objects for FFT and windowing.
+    // JUCE FFT object.
     juce::dsp::FFT fft;
-    juce::dsp::WindowingFunction<float> window;
 
-    // Internal counters.
-    int count = 0;  // Count of samples accumulated for the current hop.
-    int pos = 0;    // Current index in the circular buffers.
+    // Precomputed window table (Hann window computed in double precision then stored as float).
+    std::vector<float> windowTable;
 
-    // Circular buffers for input and output samples.
+    // Internal counters (atomic for thread safety).
+    std::atomic<int> count; // Number of samples accumulated for current hop.
+    std::atomic<int> pos;   // Current index in the circular buffers.
+
+    // Circular input and output buffers.
     std::array<float, fftSize> inputFifo{};
     std::array<float, fftSize> outputFifo{};
 
-    // Working buffer for FFT processing (stores interleaved complex numbers).
+    // Working buffer for FFT processing (interleaved complex numbers).
     std::array<float, fftSize * 2> fftData{};
 
-    // Current sample rate (Hz) and lowpass cutoff frequency (Hz).
+    // Current sample rate and lowpass cutoff frequency (both in Hz).
     float currentSampleRate;
     float lowpassCutoffFrequency;
 
     // frequencyToBin() -- Converts a frequency (Hz) to a bin index.
     inline int frequencyToBin(float frequency) const
     {
-        // Each bin represents approximately (currentSampleRate / fftSize) Hz.
         int bin = static_cast<int>((frequency * fftSize) / currentSampleRate + 0.5f);
         return std::min(bin, numBins - 1);
     }
 
-    // processFrame() -- Processes one FFT frame once hopSize samples have been accumulated.
-    // This copies fftSize samples from the circular input buffer into the working buffer,
-    // applies the window, performs FFT (if not bypassed), processes the spectrum,
-    // performs the inverse FFT, reapplies the window, and overlaps-adds the result into
-    // the output buffer.
+    // multiplyWindow() -- Applies the precomputed window to the buffer.
+    inline void multiplyWindow(float* data, int numSamples)
+    {
+        // Use JUCE's vector math for fast multiplication.
+        juce::FloatVectorOperations::multiply(data, windowTable.data(), numSamples);
+    }
+
+    // processFrame() -- Processes one FFT frame (when hopSize samples have been accumulated).
     inline void processFrame(bool bypassed)
     {
-        // Copy fftSize samples from the circular input buffer to fftData.
-        // Because the buffer is circular, we need to copy in two segments.
+        // Copy fftSize samples from the circular input buffer to the working FFT buffer.
         const float* inputPtr = inputFifo.data();
         float* fftPtr = fftData.data();
-        int samplesAfterPos = fftSize - pos;
-        std::memcpy(fftPtr, inputPtr + pos, samplesAfterPos * sizeof(float));
-        if (pos > 0)
-            std::memcpy(fftPtr + samplesAfterPos, inputPtr, pos * sizeof(float));
+        int p = pos.load(std::memory_order_relaxed);
+        int samplesAfterPos = fftSize - p;
+        std::memcpy(fftPtr, inputPtr + p, samplesAfterPos * sizeof(float));
+        if (p > 0)
+            std::memcpy(fftPtr + samplesAfterPos, inputPtr, p * sizeof(float));
 
-        // Apply the Hann window to reduce spectral leakage.
-        window.multiplyWithWindowingTable(fftPtr, fftSize);
+        // Apply window to fftData.
+        multiplyWindow(fftPtr, fftSize);
 
         if (!bypassed)
         {
-            // Perform the forward FFT (real-only).
+            // Forward FFT (real-only). 'true' indicates output is in natural order.
             fft.performRealOnlyForwardTransform(fftPtr, true);
-
-            // Process the spectrum (apply a lowpass filter).
+            // Process spectrum (apply lowpass filter).
             processSpectrum(fftPtr, numBins);
-
-            // Perform the inverse FFT to convert back to time domain.
+            // Inverse FFT to convert back to time domain.
             fft.performRealOnlyInverseTransform(fftPtr);
         }
 
-        // Reapply the window to prepare for overlap-add synthesis.
-        window.multiplyWithWindowingTable(fftPtr, fftSize);
+        // Reapply window and apply gain correction.
+        multiplyWindow(fftPtr, fftSize);
+        // Use JUCE vector math to multiply entire buffer by windowCorrection.
+        juce::FloatVectorOperations::multiply(fftPtr, fftPtr, windowCorrection, fftSize);
 
-        // Apply gain correction to account for overlapping windows.
-        for (int i = 0; i < fftSize; ++i)
-            fftPtr[i] *= windowCorrection;
-
-        // Overlap-add: add the processed frame back into the output circular buffer.
-        for (int i = 0; i < pos; ++i)
-            outputFifo[i] += fftData[i + fftSize - pos];
-        for (int i = 0; i < fftSize - pos; ++i)
-            outputFifo[i + pos] += fftData[i];
+        // Overlap-add: add the processed frame into the output circular buffer.
+        // First part: from index 0 to p-1.
+        if (p > 0)
+            juce::FloatVectorOperations::add(outputFifo.data(), fftPtr + fftSize - p, p);
+        // Second part: from index p to fftSize-1.
+        int remaining = fftSize - p;
+        if (remaining > 0)
+            juce::FloatVectorOperations::add(outputFifo.data() + p, fftPtr, remaining);
     }
 
-    // processSpectrum() -- Applies a spectral lowpass filter.
-    // The lowpass cutoff (in Hz) is converted to a bin index; all bins above that index
-    // have their magnitudes set to zero.
+    // processSpectrum() -- Applies a lowpass filter by zeroing out frequency bins above the cutoff.
     inline void processSpectrum(float* data, int numBins)
     {
-        // Treat the FFT data as an array of complex<float>.
+        // reinterpret data as complex numbers.
         auto* cdata = reinterpret_cast<std::complex<float>*>(data);
-
-        // Convert the lowpass cutoff frequency to a bin index.
         int cutoffBin = frequencyToBin(lowpassCutoffFrequency);
-
         for (int i = 0; i < numBins; ++i)
         {
             float magnitude = std::abs(cdata[i]);
             float phase = std::arg(cdata[i]);
-
-            // Zero out frequencies above the cutoff.
             if (i > cutoffBin)
-            {
                 magnitude = 0.0f;
-            }
-
-            // Reconstruct the complex number.
             cdata[i] = std::polar(magnitude, phase);
         }
     }
