@@ -7,9 +7,10 @@
 #include <algorithm>
 #include <random>
 #include <limits>
+#include <future>
 
 // Include the header-only FFT processor.
-#include "src/FFTProcessor.h"
+#include "src\FFTProcessor.h"
 
 namespace project
 {
@@ -19,14 +20,12 @@ namespace project
 #endif
 
     using namespace juce;
-    using namespace hise;
-    using namespace scriptnode;
 
     //==============================================================================
     // Griffin_FFT:
     // A simple polyphonic sampler node that uses linear interpolation for playback.
     // When the "Process FFT" parameter is enabled, the sample buffer is processed
-    // through an FFT chain that applies a lowpass filter.
+    // through an FFT chain (with lowpass filtering) performed asynchronously.
     //==============================================================================
     template <int NV>
     struct Griffin_FFT : public data::base
@@ -96,7 +95,7 @@ namespace project
         double lowpassCutoff = 5000.0; // Default lowpass cutoff in Hz.
         bool   processFFT = false;   // When true, reprocess sample via FFT.
 
-        // Temporary buffers to avoid repeated allocation during FFT processing.
+        // Preallocated temporary buffers to avoid allocation on realtime path.
         std::vector<float> fftOutputBuffer; // Reused for output data from FFT processing.
         std::vector<float> trimmedBuffer;   // Reused for trimmed output.
 
@@ -175,7 +174,6 @@ namespace project
         template <typename ProcessDataType>
         void process(ProcessDataType& data)
         {
-            // Lock external sample data and get our audio block.
             DataReadLock sl(this->sampleData);
             auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
             auto audioBlock = fixData.toAudioBlock();
@@ -183,7 +181,6 @@ namespace project
             auto* rightChannel = audioBlock.getChannelPointer(1);
             int totalSamples = data.getNumSamples();
 
-            // Get the length of the sample buffer.
             const int sampleLen = sampleBuffer.getNumSamples();
             if (sampleLen <= 0)
             {
@@ -197,22 +194,21 @@ namespace project
                 if (!voice.isActive)
                     continue;
 
-                float voiceGain = voice.velocity * gain; // Precompute voice gain.
-                double pos = voice.position;             // Local copy of current position.
-                double delta = voice.delta;              // Playback increment per sample.
+                float voiceGain = voice.velocity * gain;
+                double posLocal = voice.position;
+                double delta = voice.delta;
 
                 for (int i = 0; i < totalSamples; ++i)
                 {
-                    if (pos >= sampleLen - 1)
+                    if (posLocal >= sampleLen - 1)
                     {
                         voice.isActive = false;
                         break;
                     }
 
-                    int idx = static_cast<int>(pos);
-                    float frac = static_cast<float>(pos - idx);
+                    int idx = static_cast<int>(posLocal);
+                    float frac = static_cast<float>(posLocal - idx);
 
-                    // Linear interpolation for left and right channels.
                     float s0L = sample[0][idx];
                     float s1L = sample[0][(idx + 1 < sampleLen ? idx + 1 : sampleLen - 1)];
                     float s0R = sample[1][idx];
@@ -224,9 +220,9 @@ namespace project
                     leftChannel[i] += interpL * voiceGain;
                     rightChannel[i] += interpR * voiceGain;
 
-                    pos += delta;
+                    posLocal += delta;
                 }
-                voice.position = pos; // Save updated position.
+                voice.position = posLocal;
             }
         }
 
@@ -255,17 +251,15 @@ namespace project
                 data.add(std::move(gainParam));
             }
             {
-                // p3: Lowpass cutoff frequency in Hz.
                 parameter::data lowpassParam("Lowpass Cutoff (Hz)", { 20.0, 20000.0, 1.0 });
                 registerCallback<3>(lowpassParam);
                 lowpassParam.setDefaultValue(5000.0);
                 data.add(std::move(lowpassParam));
             }
             {
-                // p4: Process FFT toggle. When enabled, the sample buffer is reprocessed.
                 parameter::data processFFTParam("Process FFT", { 0.0, 1.0, 1.0 });
                 registerCallback<4>(processFFTParam);
-                processFFTParam.setDefaultValue(0.0); // Off by default.
+                processFFTParam.setDefaultValue(0.0);
                 data.add(std::move(processFFTParam));
             }
         }
@@ -274,7 +268,7 @@ namespace project
         // setParameter(): Parameter callback.
         // p0, p1, p2 update immediately.
         // p3 (Lowpass Cutoff) updates cutoff value.
-        // p4 (Process FFT) triggers reprocessing when toggled.
+        // p4 (Process FFT) triggers reprocessing when toggled (asynchronously).
         //==============================================================================
         template <int P>
         void setParameter(double v)
@@ -293,19 +287,20 @@ namespace project
             }
             else if constexpr (P == 3)
             {
-                // Update lowpass cutoff (no immediate reprocessing).
                 lowpassCutoff = v;
             }
             else if constexpr (P == 4)
             {
-                // Toggle FFT processing.
                 bool newVal = (v >= 0.5);
                 if (newVal != processFFT)
                 {
                     processFFT = newVal;
                     if (processFFT && sampleBuffer.getNumSamples() > 0)
                     {
-                        processSampleBufferWithFFT();
+                        std::async(std::launch::async, [this]()
+                            {
+                                this->processSampleBufferWithFFT();
+                            });
                     }
                 }
             }
@@ -339,30 +334,23 @@ namespace project
             for (int ch = 0; ch < sampleBuffer.getNumChannels(); ++ch)
             {
                 const float* inData = sampleBuffer.getReadPointer(ch);
-                // Resize our temporary output buffer and fill with zeros.
                 fftOutputBuffer.resize(numSamples + FFTProcessor::fftSize);
                 std::fill(fftOutputBuffer.begin(), fftOutputBuffer.end(), 0.0f);
 
                 FFTProcessor fftProc;
                 fftProc.reset();
-                // Configure the FFT processor with the current sample rate and lowpass cutoff.
                 fftProc.setSampleRate(static_cast<float>(sampleRate));
                 fftProc.setLowpassCutoff(static_cast<float>(lowpassCutoff));
 
-                // Process the sample data through the FFT.
                 for (int i = 0; i < numSamples; ++i)
                 {
                     float outSample = fftProc.processSample(inData[i], false);
                     fftOutputBuffer[i] = outSample;
                 }
-                // Flush remaining internal samples.
                 std::vector<float> flushed = fftProc.flushRemaining(false);
-                // Append flushed samples to our output buffer.
                 fftOutputBuffer.insert(fftOutputBuffer.end(), flushed.begin(), flushed.end());
 
-                // Reuse the trimmed buffer.
                 trimmedBuffer.resize(numSamples);
-                // Discard the initial latency (equal to FFTProcessor::fftSize samples) and keep the next numSamples.
                 if (static_cast<int>(fftOutputBuffer.size()) >= FFTProcessor::fftSize + numSamples)
                 {
                     std::copy(fftOutputBuffer.begin() + FFTProcessor::fftSize,
@@ -378,7 +366,6 @@ namespace project
                 std::copy(trimmedBuffer.begin(), trimmedBuffer.end(), outPtr);
             }
 
-            // Replace the original sampleBuffer with the processed buffer.
             sampleBuffer.makeCopyOf(processedBuffer, true);
             sample[0] = sampleBuffer.getReadPointer(0);
             sample[1] = (sampleBuffer.getNumChannels() > 1 ? sampleBuffer.getReadPointer(1) : sample[0]);
