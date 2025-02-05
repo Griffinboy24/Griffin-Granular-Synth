@@ -10,7 +10,7 @@
 #include <future>
 
 // Include the header-only FFT processor.
-#include "src\FFTProcessor.h"
+#include "src/FFTProcessor.h"
 
 namespace project
 {
@@ -81,6 +81,9 @@ namespace project
         double sampleRate = 44100.0;          // Host sample rate.
         double sampleRateRatio = 1.0;         // Ratio: file sample rate / host sample rate.
 
+        // Persistent FFTProcessor instance.
+        FFTProcessor fftProcInstance;
+
         //==============================================================================
         // Parameters:
         // p0: Pitch offset (semitones)
@@ -107,6 +110,10 @@ namespace project
             sampleRate = specs.sampleRate;
             initPitchRatios();
             voices.prepare(specs);
+            // Initialize the persistent FFTProcessor instance.
+            fftProcInstance.reset();
+            fftProcInstance.setSampleRate(static_cast<float>(sampleRate));
+            fftProcInstance.setLowpassCutoff(static_cast<float>(lowpassCutoff));
         }
 
         //==============================================================================
@@ -288,6 +295,8 @@ namespace project
             else if constexpr (P == 3)
             {
                 lowpassCutoff = v;
+                // Also update the persistent FFTProcessor instance.
+                fftProcInstance.setLowpassCutoff(static_cast<float>(lowpassCutoff));
             }
             else if constexpr (P == 4)
             {
@@ -320,6 +329,7 @@ namespace project
         // Applies FFT processing (with lowpass filtering) to the entire sample buffer.
         // Processes each channel separately, discards the initial latency,
         // and replaces the original buffer with the processed data.
+        // Uses the persistent FFTProcessor instance (fftProcInstance) for continuous state.
         //==============================================================================
         void processSampleBufferWithFFT()
         {
@@ -337,17 +347,17 @@ namespace project
                 fftOutputBuffer.resize(numSamples + FFTProcessor::fftSize);
                 std::fill(fftOutputBuffer.begin(), fftOutputBuffer.end(), 0.0f);
 
-                FFTProcessor fftProc;
-                fftProc.reset();
-                fftProc.setSampleRate(static_cast<float>(sampleRate));
-                fftProc.setLowpassCutoff(static_cast<float>(lowpassCutoff));
+                // Do not create a new FFTProcessor; use the persistent instance.
+                // Do not call reset() here to maintain continuity.
+                fftProcInstance.setSampleRate(static_cast<float>(sampleRate));
+                fftProcInstance.setLowpassCutoff(static_cast<float>(lowpassCutoff));
 
                 for (int i = 0; i < numSamples; ++i)
                 {
-                    float outSample = fftProc.processSample(inData[i], false);
+                    float outSample = fftProcInstance.processSample(inData[i], false);
                     fftOutputBuffer[i] = outSample;
                 }
-                std::vector<float> flushed = fftProc.flushRemaining(false);
+                std::vector<float> flushed = fftProcInstance.flushRemaining(false);
                 fftOutputBuffer.insert(fftOutputBuffer.end(), flushed.begin(), flushed.end());
 
                 trimmedBuffer.resize(numSamples);
