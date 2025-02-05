@@ -1,0 +1,395 @@
+#pragma once
+
+#include <JuceHeader.h>
+#include <array>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <random>
+#include <limits>
+
+// Include the header-only FFT processor.
+#include "src/FFTProcessor.h"
+
+namespace project
+{
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+    using namespace juce;
+    using namespace hise;
+    using namespace scriptnode;
+
+    //==============================================================================
+    // Griffin_FFT:
+    // A simple polyphonic sampler node that uses linear interpolation for playback.
+    // When the "Process FFT" parameter is enabled, the sample buffer is processed
+    // through an FFT chain that applies a lowpass filter.
+    //==============================================================================
+    template <int NV>
+    struct Griffin_FFT : public data::base
+    {
+        SNEX_NODE(Griffin_FFT);
+        struct MetadataClass { SN_NODE_ID("Griffin_FFT"); };
+
+        // Node properties.
+        static constexpr bool isModNode() { return true; }
+        static constexpr bool isPolyphonic() { return NV > 1; }
+        static constexpr bool hasTail() { return false; }
+        static constexpr bool isSuspendedOnSilence() { return false; }
+        static constexpr int  getFixChannelAmount() { return 2; }
+
+        static constexpr int NumTables = 0;
+        static constexpr int NumSliderPacks = 0;
+        static constexpr int NumAudioFiles = 1;
+        static constexpr int NumFilters = 0;
+        static constexpr int NumDisplayBuffers = 0;
+
+        //==============================================================================
+        // Voice struct:
+        // Stores playback state for a single note.
+        //==============================================================================
+        struct Voice
+        {
+            int   midiNote = 60;
+            bool  isActive = false;
+            float velocity = 1.0f;
+            double position = 0.0;  // Current fractional sample position.
+            double delta = 1.0;     // Read increment per output sample.
+
+            // Resets the voice with new playback parameters.
+            void reset(int note, float vel, double startPos, double readDelta)
+            {
+                midiNote = note;
+                velocity = vel;
+                position = startPos;
+                delta = readDelta;
+                isActive = true;
+            }
+        };
+
+        //==============================================================================
+        // Member variables.
+        //==============================================================================
+        PolyData<Voice, NV> voices;         // Container for polyphonic voices.
+        ExternalData        sampleData;     // Data for the loaded audio file.
+        AudioBuffer<float>  sampleBuffer;    // Buffer containing the sample.
+        std::array<const float*, 2> sample{ nullptr, nullptr }; // Stereo read pointers.
+
+        std::array<float, 128> pitchRatios{}; // Precomputed pitch ratios.
+        double sampleRate = 44100.0;          // Host sample rate.
+        double sampleRateRatio = 1.0;         // Ratio: file sample rate / host sample rate.
+
+        //==============================================================================
+        // Parameters:
+        // p0: Pitch offset (semitones)
+        // p1: Playhead Position (0.0 to 1.0, fraction of sample length)
+        // p2: Gain (0.0 to 1.0)
+        // p3: Lowpass Cutoff Frequency (Hz)
+        // p4: Process FFT (boolean toggle; 0.0 = off, 1.0 = on)
+        //==============================================================================
+        double pitchOffsetSemitones = 0.0;
+        float  playheadPosition = 0.0f;
+        float  gain = 1.0f;
+        double lowpassCutoff = 5000.0; // Default lowpass cutoff in Hz.
+        bool   processFFT = false;   // When true, reprocess sample via FFT.
+
+        // Temporary buffers to avoid repeated allocation during FFT processing.
+        std::vector<float> fftOutputBuffer; // Reused for output data from FFT processing.
+        std::vector<float> trimmedBuffer;   // Reused for trimmed output.
+
+        //==============================================================================
+        // prepare(): Called during initialization.
+        //==============================================================================
+        void prepare(PrepareSpecs specs)
+        {
+            sampleRate = specs.sampleRate;
+            initPitchRatios();
+            voices.prepare(specs);
+        }
+
+        //==============================================================================
+        // updateDerivedParameters(): Update derived values from the loaded sample.
+        //==============================================================================
+        void updateDerivedParameters()
+        {
+            sampleRateRatio = (sampleData.sampleRate > 0 ? sampleData.sampleRate : 44100.0) / sampleRate;
+        }
+
+        //==============================================================================
+        // setExternalData(): Called when a new audio file is loaded.
+        // Copies file data into sampleBuffer.
+        //==============================================================================
+        void setExternalData(const ExternalData& ed, int /*index*/)
+        {
+            sampleData = ed;
+            AudioSampleBuffer tempBuffer = ed.toAudioSampleBuffer();
+            int numSamples = tempBuffer.getNumSamples();
+            int numChannels = tempBuffer.getNumChannels();
+
+            if (numSamples <= 0)
+            {
+                static AudioBuffer<float> safetyBuffer(2, 4);
+                safetyBuffer.clear();
+                sampleBuffer.makeCopyOf(safetyBuffer, true);
+            }
+            else
+            {
+                sampleBuffer.makeCopyOf(tempBuffer, true);
+            }
+            sample[0] = sampleBuffer.getReadPointer(0);
+            sample[1] = (numChannels > 1 ? sampleBuffer.getReadPointer(1) : sample[0]);
+
+            updateDerivedParameters();
+            // FFT processing will be triggered only via parameter p4.
+        }
+
+        //==============================================================================
+        // handleHiseEvent(): Called on note-on events.
+        // Resets a voice with correct playback settings.
+        //==============================================================================
+        void handleHiseEvent(HiseEvent& e)
+        {
+            if (e.isNoteOn())
+            {
+                auto& voice = voices.get();
+                int currentSampleLength = sampleBuffer.getNumSamples();
+                if (currentSampleLength < 1)
+                    currentSampleLength = 1;
+                double startPos = playheadPosition * (currentSampleLength - 1);
+
+                double baseDelta = pitchRatios[e.getNoteNumber()] * sampleRateRatio;
+                double globalFactor = std::pow(2.0, pitchOffsetSemitones / 12.0);
+                double readDelta = baseDelta * globalFactor;
+
+                voice.reset(e.getNoteNumber(), e.getFloatVelocity(), startPos, readDelta);
+            }
+        }
+
+        //==============================================================================
+        // process(): Called per audio block.
+        // For each active voice, reads the sample data using linear interpolation.
+        //==============================================================================
+        template <typename ProcessDataType>
+        void process(ProcessDataType& data)
+        {
+            // Lock external sample data and get our audio block.
+            DataReadLock sl(this->sampleData);
+            auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
+            auto audioBlock = fixData.toAudioBlock();
+            auto* leftChannel = audioBlock.getChannelPointer(0);
+            auto* rightChannel = audioBlock.getChannelPointer(1);
+            int totalSamples = data.getNumSamples();
+
+            // Get the length of the sample buffer.
+            const int sampleLen = sampleBuffer.getNumSamples();
+            if (sampleLen <= 0)
+            {
+                audioBlock.clear();
+                return;
+            }
+
+            // For each active voice, perform linear interpolation.
+            for (auto& voice : voices)
+            {
+                if (!voice.isActive)
+                    continue;
+
+                float voiceGain = voice.velocity * gain; // Precompute voice gain.
+                double pos = voice.position;             // Local copy of current position.
+                double delta = voice.delta;              // Playback increment per sample.
+
+                for (int i = 0; i < totalSamples; ++i)
+                {
+                    if (pos >= sampleLen - 1)
+                    {
+                        voice.isActive = false;
+                        break;
+                    }
+
+                    int idx = static_cast<int>(pos);
+                    float frac = static_cast<float>(pos - idx);
+
+                    // Linear interpolation for left and right channels.
+                    float s0L = sample[0][idx];
+                    float s1L = sample[0][(idx + 1 < sampleLen ? idx + 1 : sampleLen - 1)];
+                    float s0R = sample[1][idx];
+                    float s1R = sample[1][(idx + 1 < sampleLen ? idx + 1 : sampleLen - 1)];
+
+                    float interpL = s0L + frac * (s1L - s0L);
+                    float interpR = s0R + frac * (s1R - s0R);
+
+                    leftChannel[i] += interpL * voiceGain;
+                    rightChannel[i] += interpR * voiceGain;
+
+                    pos += delta;
+                }
+                voice.position = pos; // Save updated position.
+            }
+        }
+
+        //==============================================================================
+        // createParameters(): Sets up node parameters.
+        // p0: Pitch offset, p1: Playhead position, p2: Gain, p3: Lowpass cutoff (Hz), p4: Process FFT.
+        //==============================================================================
+        void createParameters(ParameterDataList& data)
+        {
+            {
+                parameter::data pitchOffsetParam("Pitch (semitones)", { -24.0, 24.0, 0.01 });
+                registerCallback<0>(pitchOffsetParam);
+                pitchOffsetParam.setDefaultValue(0.0);
+                data.add(std::move(pitchOffsetParam));
+            }
+            {
+                parameter::data playheadParam("Playhead Position", { 0.0, 1.0, 0.001 });
+                registerCallback<1>(playheadParam);
+                playheadParam.setDefaultValue(0.0);
+                data.add(std::move(playheadParam));
+            }
+            {
+                parameter::data gainParam("Gain", { 0.0, 1.0, 0.01 });
+                registerCallback<2>(gainParam);
+                gainParam.setDefaultValue(1.0);
+                data.add(std::move(gainParam));
+            }
+            {
+                // p3: Lowpass cutoff frequency in Hz.
+                parameter::data lowpassParam("Lowpass Cutoff (Hz)", { 20.0, 20000.0, 1.0 });
+                registerCallback<3>(lowpassParam);
+                lowpassParam.setDefaultValue(5000.0);
+                data.add(std::move(lowpassParam));
+            }
+            {
+                // p4: Process FFT toggle. When enabled, the sample buffer is reprocessed.
+                parameter::data processFFTParam("Process FFT", { 0.0, 1.0, 1.0 });
+                registerCallback<4>(processFFTParam);
+                processFFTParam.setDefaultValue(0.0); // Off by default.
+                data.add(std::move(processFFTParam));
+            }
+        }
+
+        //==============================================================================
+        // setParameter(): Parameter callback.
+        // p0, p1, p2 update immediately.
+        // p3 (Lowpass Cutoff) updates cutoff value.
+        // p4 (Process FFT) triggers reprocessing when toggled.
+        //==============================================================================
+        template <int P>
+        void setParameter(double v)
+        {
+            if constexpr (P == 0)
+            {
+                pitchOffsetSemitones = v;
+            }
+            else if constexpr (P == 1)
+            {
+                playheadPosition = static_cast<float>(v);
+            }
+            else if constexpr (P == 2)
+            {
+                gain = static_cast<float>(v);
+            }
+            else if constexpr (P == 3)
+            {
+                // Update lowpass cutoff (no immediate reprocessing).
+                lowpassCutoff = v;
+            }
+            else if constexpr (P == 4)
+            {
+                // Toggle FFT processing.
+                bool newVal = (v >= 0.5);
+                if (newVal != processFFT)
+                {
+                    processFFT = newVal;
+                    if (processFFT && sampleBuffer.getNumSamples() > 0)
+                    {
+                        processSampleBufferWithFFT();
+                    }
+                }
+            }
+        }
+
+        //==============================================================================
+        // initPitchRatios(): Precompute pitch ratios for MIDI notes 0-127.
+        //==============================================================================
+        void initPitchRatios()
+        {
+            for (int i = 0; i < 128; ++i)
+                pitchRatios[i] = std::pow(2.0f, (float)(i - 60) / 12.0f);
+        }
+
+        //==============================================================================
+        // processSampleBufferWithFFT():
+        // Applies FFT processing (with lowpass filtering) to the entire sample buffer.
+        // Processes each channel separately, discards the initial latency,
+        // and replaces the original buffer with the processed data.
+        //==============================================================================
+        void processSampleBufferWithFFT()
+        {
+            const int numSamples = sampleBuffer.getNumSamples();
+            if (numSamples == 0)
+                return;
+
+            AudioBuffer<float> processedBuffer;
+            processedBuffer.setSize(sampleBuffer.getNumChannels(), numSamples);
+
+            // Process each channel individually.
+            for (int ch = 0; ch < sampleBuffer.getNumChannels(); ++ch)
+            {
+                const float* inData = sampleBuffer.getReadPointer(ch);
+                // Resize our temporary output buffer and fill with zeros.
+                fftOutputBuffer.resize(numSamples + FFTProcessor::fftSize);
+                std::fill(fftOutputBuffer.begin(), fftOutputBuffer.end(), 0.0f);
+
+                FFTProcessor fftProc;
+                fftProc.reset();
+                // Configure the FFT processor with the current sample rate and lowpass cutoff.
+                fftProc.setSampleRate(static_cast<float>(sampleRate));
+                fftProc.setLowpassCutoff(static_cast<float>(lowpassCutoff));
+
+                // Process the sample data through the FFT.
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    float outSample = fftProc.processSample(inData[i], false);
+                    fftOutputBuffer[i] = outSample;
+                }
+                // Flush remaining internal samples.
+                std::vector<float> flushed = fftProc.flushRemaining(false);
+                // Append flushed samples to our output buffer.
+                fftOutputBuffer.insert(fftOutputBuffer.end(), flushed.begin(), flushed.end());
+
+                // Reuse the trimmed buffer.
+                trimmedBuffer.resize(numSamples);
+                // Discard the initial latency (equal to FFTProcessor::fftSize samples) and keep the next numSamples.
+                if (static_cast<int>(fftOutputBuffer.size()) >= FFTProcessor::fftSize + numSamples)
+                {
+                    std::copy(fftOutputBuffer.begin() + FFTProcessor::fftSize,
+                        fftOutputBuffer.begin() + FFTProcessor::fftSize + numSamples,
+                        trimmedBuffer.begin());
+                }
+                else
+                {
+                    std::fill(trimmedBuffer.begin(), trimmedBuffer.end(), 0.0f);
+                }
+
+                float* outPtr = processedBuffer.getWritePointer(ch);
+                std::copy(trimmedBuffer.begin(), trimmedBuffer.end(), outPtr);
+            }
+
+            // Replace the original sampleBuffer with the processed buffer.
+            sampleBuffer.makeCopyOf(processedBuffer, true);
+            sample[0] = sampleBuffer.getReadPointer(0);
+            sample[1] = (sampleBuffer.getNumChannels() > 1 ? sampleBuffer.getReadPointer(1) : sample[0]);
+        }
+
+        //==============================================================================
+        // Unused functions (placeholders).
+        //==============================================================================
+        template <typename FrameDataType>
+        void processFrame(FrameDataType& /*data*/) {}
+        void reset() {}
+    };
+
+} // namespace project
