@@ -18,8 +18,7 @@
 // then zero padded to paddedSize (a power of 2 >= fftSize) for the FFT; after
 // spectral processing and inverse FFT the output is taken as the first fftSize samples,
 // rescaled for correct amplitude. Overlap-add with 75% overlap ensures that the windowing
-// effects cancel. This design follows the approach in 
-// "FFT Processing in JUCE" (https://audiodev.blog/fft-processing/).
+// effects cancel. 
 //==============================================================================
 class FFTProcessor
 {
