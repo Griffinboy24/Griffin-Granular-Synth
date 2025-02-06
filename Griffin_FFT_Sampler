@@ -10,7 +10,7 @@
 #include <future>
 
 // Include the header-only FFT processor.
-#include "src/FFTProcessor.h"
+#include "src/Griffin_FFT_HQ.h"
 
 namespace project
 {
@@ -28,10 +28,10 @@ namespace project
     // through an FFT chain (with lowpass filtering) performed asynchronously.
     //==============================================================================
     template <int NV>
-    struct Griffin_FFT : public data::base
+    struct Griffin_FFT_Sampler : public data::base
     {
-        SNEX_NODE(Griffin_FFT);
-        struct MetadataClass { SN_NODE_ID("Griffin_FFT"); };
+        SNEX_NODE(Griffin_FFT_Sampler);
+        struct MetadataClass { SN_NODE_ID("Griffin_FFT_Sampler"); };
 
         // Node properties.
         static constexpr bool isModNode() { return true; }
@@ -347,8 +347,6 @@ namespace project
                 fftOutputBuffer.resize(numSamples + FFTProcessor::fftSize);
                 std::fill(fftOutputBuffer.begin(), fftOutputBuffer.end(), 0.0f);
 
-                // Do not create a new FFTProcessor; use the persistent instance.
-                // Do not call reset() here to maintain continuity.
                 fftProcInstance.setSampleRate(static_cast<float>(sampleRate));
                 fftProcInstance.setLowpassCutoff(static_cast<float>(lowpassCutoff));
 
