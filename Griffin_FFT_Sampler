@@ -6,6 +6,21 @@
 #include <algorithm>
 #include <future>
 #include "src/GriffinFFT_HQ.h"
+#include "src/GriffinFFT_LQ.h"
+
+/*
+    Griffin_FFT_Sampler
+    -------------------
+    This node uses GriffinFFT_HQ to process external sample data
+    with an FFT-based effect. It loads sample data from an
+    external file (external data), then uses GriffinFFT_HQ to process the buffer. To create your own
+    spectral effect, modify the processSpectrum() method in GriffinFFT_HQ.
+
+    Key points:
+      • prepare(): initializes the sampler and FFT instance.
+      • setExternalData(): loads sample data and sets the FFT sample rate.
+      • processSampleBufferWithFFT(): calls the FFT processing on the entire file.
+*/
 
 namespace project
 {
@@ -13,14 +28,12 @@ namespace project
     using namespace hise;
     using namespace scriptnode;
 
-    template <int NV> struct Griffin_FFT_Sampler : public data::base
+    template <int NV>
+    struct Griffin_FFT_Sampler : public data::base
     {
         SNEX_NODE(Griffin_FFT_Sampler);
 
-        struct MetadataClass
-        {
-            SN_NODE_ID("Griffin_FFT_Sampler");
-        };
+        struct MetadataClass { SN_NODE_ID("Griffin_FFT_Sampler"); };
 
         static constexpr bool isModNode() { return false; }
         static constexpr bool isPolyphonic() { return NV > 1; }
@@ -34,7 +47,7 @@ namespace project
         static constexpr int NumFilters = 0;
         static constexpr int NumDisplayBuffers = 0;
 
-        // Voice struct.
+        // Voice data
         struct Voice
         {
             int   midiNote = 60;
@@ -62,28 +75,30 @@ namespace project
         double sampleRate = 44100.0;
         double sampleRateRatio = 1.0;
 
-        // Persistent FFT processor.
+        // Create a persistent FFT processor (from GriffinFFT.h)
         GriffinFFT_HQ fftHqInstance;
 
-        //==============================================================================
+        // --- prepare()
+        // Initializes the sampler and sets the FFT instance sample rate.
         void prepare(PrepareSpecs specs)
         {
-            // Use the project sample rate for initial preparation.
             sampleRate = specs.sampleRate;
             initPitchRatios();
             voices.prepare(specs);
             fftHqInstance.reset();
-            // In absence of file data, we set the FFT sample rate to the project rate.
             fftHqInstance.setSampleRate(static_cast<float>(sampleRate));
-            fftHqInstance.setLowpassCutoff(static_cast<float>(5000.0));
+            fftHqInstance.setLowpassCutoff(5000.0f);
         }
 
+        // --- updateDerivedParameters()
+        // Updates the sample rate ratio based on file data.
         void updateDerivedParameters()
         {
-            // Update ratio using the file sample rate (if available)
             sampleRateRatio = (sampleData.sampleRate > 0 ? sampleData.sampleRate : 44100.0) / sampleRate;
         }
 
+        // --- setExternalData()
+        // Loads the sample file and sets the FFT sample rate accordingly.
         void setExternalData(const ExternalData& ed, int /*index*/)
         {
             sampleData = ed;
@@ -105,10 +120,12 @@ namespace project
             sample[1] = (numChannels > 1 ? sampleBuffer.getReadPointer(1) : sample[0]);
 
             updateDerivedParameters();
-            // IMPORTANT: Set the FFT's sample rate to the file's sample rate!
+            // Set the FFT's sample rate to the file's sample rate.
             fftHqInstance.setSampleRate(static_cast<float>(sampleData.sampleRate > 0 ? sampleData.sampleRate : 44100.0));
         }
 
+        // --- handleHiseEvent()
+        // On note-on events, resets a voice with start position and read delta.
         void handleHiseEvent(HiseEvent& e)
         {
             if (e.isNoteOn())
@@ -118,15 +135,16 @@ namespace project
                 if (currentSampleLength < 1)
                     currentSampleLength = 1;
                 double startPos = playheadPosition * (currentSampleLength - 1);
-
                 double baseDelta = pitchRatios[e.getNoteNumber()] * sampleRateRatio;
                 double globalFactor = std::pow(2.0, pitchOffsetSemitones / 12.0);
                 double readDelta = baseDelta * globalFactor;
-
                 voice.reset(e.getNoteNumber(), e.getFloatVelocity(), startPos, readDelta);
             }
         }
 
+        // --- process()
+        // Processes audio by reading from the sample buffer and adding
+        // interpolated samples to the output channels.
         template <typename ProcessDataType>
         void process(ProcessDataType& data)
         {
@@ -160,7 +178,6 @@ namespace project
                         voice.isActive = false;
                         break;
                     }
-
                     int idx = static_cast<int>(posLocal);
                     float frac = static_cast<float>(posLocal - idx);
 
@@ -181,6 +198,8 @@ namespace project
             }
         }
 
+        // --- createParameters()
+        // Sets up UI parameters for pitch offset, playhead, gain, lowpass cutoff, and FFT processing enable.
         void createParameters(ParameterDataList& data)
         {
             {
@@ -215,21 +234,17 @@ namespace project
             }
         }
 
+        // --- setParameter()
+        // Updates parameters based on index.
         template <int P>
         void setParameter(double v)
         {
             if constexpr (P == 0)
-            {
                 pitchOffsetSemitones = v;
-            }
             else if constexpr (P == 1)
-            {
                 playheadPosition = static_cast<float>(v);
-            }
             else if constexpr (P == 2)
-            {
                 gain = static_cast<float>(v);
-            }
             else if constexpr (P == 3)
             {
                 lowpassCutoff = v;
@@ -243,22 +258,23 @@ namespace project
                     processFFT = newVal;
                     if (processFFT && sampleBuffer.getNumSamples() > 0)
                     {
-                        std::async(std::launch::async, [this]()
-                            {
-                                this->processSampleBufferWithFFT();
-                            });
+                        std::async(std::launch::async, [this]() { this->processSampleBufferWithFFT(); });
                     }
                 }
             }
         }
 
+        // --- initPitchRatios()
+        // Precomputes pitch ratios for MIDI note numbers.
         void initPitchRatios()
         {
             for (int i = 0; i < 128; ++i)
                 pitchRatios[i] = std::pow(2.0f, (float)(i - 60) / 12.0f);
         }
 
-        // Now simply call the GriffinFFT_HQ buffer processing interface.
+        // --- processSampleBufferWithFFT()
+        // Calls the FFT processing interface to process the entire sample buffer.
+        // This is where GriffinFFT_HQ processes the sample data (using its processEntireBuffer method).
         void processSampleBufferWithFFT()
         {
             const int numSamples = sampleBuffer.getNumSamples();
@@ -268,10 +284,8 @@ namespace project
             for (int ch = 0; ch < sampleBuffer.getNumChannels(); ++ch)
             {
                 const float* inData = sampleBuffer.getReadPointer(ch);
-                // Process the entire channel buffer via the new interface.
                 auto processed = fftHqInstance.processEntireBuffer(inData, numSamples, false);
                 float* outPtr = sampleBuffer.getWritePointer(ch);
-                // Ensure the processed buffer is of the same length.
                 int copyLength = std::min(static_cast<int>(processed.size()), numSamples);
                 std::copy(processed.begin(), processed.begin() + copyLength, outPtr);
             }
@@ -279,10 +293,12 @@ namespace project
             sample[1] = (sampleBuffer.getNumChannels() > 1 ? sampleBuffer.getReadPointer(1) : sample[0]);
         }
 
+        // --- Unused Functions ---
         template <typename FrameDataType>
         void processFrame(FrameDataType& /*data*/) {}
         void reset() {}
 
+        // --- Member Variables ---
         double pitchOffsetSemitones = 0.0;
         float  playheadPosition = 0.0f;
         float  gain = 1.0f;
