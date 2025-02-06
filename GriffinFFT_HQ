@@ -1,0 +1,203 @@
+#pragma once
+#include <JuceHeader.h>
+#include <array>
+#include <vector>
+#include <complex>
+#include <cstring>
+#include <cmath>
+#include <algorithm>
+
+class GriffinFFT_HQ
+{
+public:
+    // FFT configuration.
+    static constexpr int fftOrder = 11;              // 2^11 = 2048 samples.
+    static constexpr int fftSize = 1 << fftOrder;
+    static constexpr int numBins = fftSize / 2 + 1;
+    static constexpr int overlap = 4;                // 75% overlap.
+    static constexpr int hopSize = fftSize / overlap;
+
+    // Zero-padding configuration.
+    static constexpr int zeroPadOrder = fftOrder + 1;  // 11 + 1 = 12, so paddedSize = 4096.
+    static constexpr int paddedSize = 1 << zeroPadOrder;
+    static constexpr int paddedNumBins = paddedSize / 2 + 1;
+    static constexpr float windowCorrection = 2.0f / 3.0f;
+
+    inline void setSampleRate(float sr) { currentSampleRate = sr; }
+    inline void setLowpassCutoff(float freqHz) { lowpassCutoffFrequency = freqHz; }
+
+    //--------------------------------------------------------------------------  
+    // Constructor
+    //--------------------------------------------------------------------------  
+    GriffinFFT_HQ() : fft(fftOrder), fftPadded(zeroPadOrder),
+        currentSampleRate(44100.0f), lowpassCutoffFrequency(5000.0f),
+        pos(0), count(0)
+    {
+        // Allocate windows of size fftSize.
+        windowTable.resize(fftSize);
+        compositeWindow.resize(fftSize);
+        // Use (fftSize - 1) so that the window reaches zero at the end.
+        for (int i = 0; i < fftSize; ++i)
+            windowTable[i] = 0.5f * (1.0f - std::cos((2.0f * float(3.14159265358979323846) * i) / (fftSize - 1)));
+        for (int i = 0; i < fftSize; ++i)
+            compositeWindow[i] = windowTable[i] * windowTable[i] * windowCorrection;
+        inputFifo.fill(0.0f);
+        outputFifo.fill(0.0f);
+        fftData.resize(fftSize * 2, 0.0f);
+        paddedData.resize(paddedSize * 2, 0.0f);
+    }
+
+    //--------------------------------------------------------------------------  
+    // reset()
+    //--------------------------------------------------------------------------  
+    inline void reset()
+    {
+        count = 0;
+        pos = 0;
+        inputFifo.fill(0.0f);
+        outputFifo.fill(0.0f);
+    }
+
+    //--------------------------------------------------------------------------  
+    // processBlock()
+    //--------------------------------------------------------------------------  
+    inline void processBlock(const float* inBlock, float* outBlock, int numSamples, bool bypassed)
+    {
+        int i = 0;
+        while (i < numSamples)
+        {
+            int localPos = pos;
+            int samplesUntilEnd = fftSize - localPos;
+            int samplesUntilFFT = hopSize - count;
+            int chunk = std::min({ numSamples - i, samplesUntilEnd, samplesUntilFFT });
+
+            std::copy(inBlock + i, inBlock + i + chunk, inputFifo.begin() + localPos);
+            std::copy(outputFifo.begin() + localPos, outputFifo.begin() + localPos + chunk, outBlock + i);
+            std::fill(outputFifo.begin() + localPos, outputFifo.begin() + localPos + chunk, 0.0f);
+
+            localPos = (localPos + chunk) & (fftSize - 1);
+            pos = localPos;
+            count += chunk;
+            i += chunk;
+
+            if (count >= hopSize)
+            {
+                count = 0;
+                processFrame(bypassed);
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------  
+    // processSample()
+    //--------------------------------------------------------------------------  
+    inline float processSample(float sample, bool bypassed)
+    {
+        float outSample = outputFifo[pos];
+        inputFifo[pos] = sample;
+        outputFifo[pos] = 0.0f;
+        pos = (pos + 1) & (fftSize - 1);
+        count = (count + 1) % hopSize;
+        if (count == 0)
+            processFrame(bypassed);
+        return outSample;
+    }
+
+    //--------------------------------------------------------------------------  
+    // flushRemaining()
+    //--------------------------------------------------------------------------  
+    inline std::vector<float> flushRemaining(bool bypassed)
+    {
+        std::vector<float> flushed;
+        flushed.reserve(fftSize);
+        for (int i = 0; i < fftSize; ++i)
+            flushed.push_back(processSample(0.0f, bypassed));
+        return flushed;
+    }
+
+    //--------------------------------------------------------------------------  
+    // New interface: processEntireBuffer()
+    // Accepts an input buffer and returns a processed buffer trimmed of FFT delay.
+    //--------------------------------------------------------------------------  
+    std::vector<float> processEntireBuffer(const float* inData, int numSamples, bool bypassed)
+    {
+        reset();
+        // Create an output buffer large enough to hold processed samples plus tail.
+        std::vector<float> outBuffer(numSamples + fftSize, 0.0f);
+        processBlock(inData, outBuffer.data(), numSamples, bypassed);
+        auto flushed = flushRemaining(bypassed);
+        outBuffer.insert(outBuffer.end(), flushed.begin(), flushed.end());
+        // Remove the initial delay of fftSize samples.
+        const int delay = fftSize;
+        int totalOut = static_cast<int>(outBuffer.size());
+        int trimmedLength = std::min(totalOut - delay, numSamples);
+        std::vector<float> trimmed(trimmedLength, 0.0f);
+        std::copy(outBuffer.begin() + delay, outBuffer.begin() + delay + trimmedLength, trimmed.begin());
+        return trimmed;
+    }
+
+private:
+    juce::dsp::FFT fft;
+    juce::dsp::FFT fftPadded;
+
+    std::vector<float> windowTable;
+    std::vector<float> compositeWindow;
+
+    std::array<float, fftSize> inputFifo{};
+    std::array<float, fftSize> outputFifo{};
+
+    std::vector<float> fftData;
+    std::vector<float> paddedData;
+
+    int count;
+    int pos;
+    float currentSampleRate;
+    float lowpassCutoffFrequency;
+
+    inline void reassembleFFTFrame(float* dest)
+    {
+        for (int i = 0; i < fftSize; ++i)
+            dest[i] = inputFifo[(pos + i) & (fftSize - 1)];
+    }
+
+    inline void processFrame(bool bypassed)
+    {
+        float* fptr = fftData.data();
+        reassembleFFTFrame(fptr);
+        std::memcpy(paddedData.data(), fptr, fftSize * sizeof(float));
+        std::fill(paddedData.begin() + fftSize, paddedData.end(), 0.0f);
+        juce::FloatVectorOperations::multiply(paddedData.data(), windowTable.data(), fftSize);
+        if (!bypassed)
+        {
+            fftPadded.performRealOnlyForwardTransform(paddedData.data(), true);
+            processSpectrum(paddedData.data(), paddedNumBins);
+            fftPadded.performRealOnlyInverseTransform(paddedData.data());
+        }
+        juce::FloatVectorOperations::multiply(paddedData.data(), compositeWindow.data(), fftSize);
+        if (pos > 0)
+            juce::FloatVectorOperations::add(outputFifo.data(), paddedData.data() + fftSize - pos, pos);
+        int remaining = fftSize - pos;
+        if (remaining > 0)
+            juce::FloatVectorOperations::add(outputFifo.data() + pos, paddedData.data(), remaining);
+    }
+
+    inline void processSpectrum(float* data, int nBins)
+    {
+        auto* cdata = reinterpret_cast<std::complex<float>*>(data);
+        int cutoffBin = frequencyToBin(lowpassCutoffFrequency);
+        for (int i = 0; i < nBins; ++i)
+        {
+            float mag = std::abs(cdata[i]);
+            float phase = std::arg(cdata[i]);
+            if (i > cutoffBin)
+                mag = 0.0f;
+            cdata[i] = std::polar(mag, phase);
+        }
+    }
+
+    inline int frequencyToBin(float frequency) const
+    {
+        int bin = static_cast<int>((frequency * paddedSize) / currentSampleRate + 0.5f);
+        return std::min(bin, paddedNumBins - 1);
+    }
+};
