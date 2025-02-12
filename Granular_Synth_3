@@ -71,7 +71,6 @@ namespace project
             samplesDone = 0;
             isPunchy = false;
             segmentIndex = 0;
-
             if (durSamples < 1)
             {
                 amplitude = 0.0f;
@@ -80,7 +79,6 @@ namespace project
                 finished = true;
                 return;
             }
-
             amplitude = 0.0f;
             double rdur = 1.0 / double(durSamples);
             double rdur2 = rdur * rdur;
@@ -97,7 +95,6 @@ namespace project
             isPunchy = true;
             segmentIndex = 0;
             finalAmplitude = gA;
-
             if (durSamples < 2)
             {
                 amplitude = 0.0f;
@@ -106,10 +103,8 @@ namespace project
                 finished = true;
                 return;
             }
-
             int half = durSamples / 2;
             if (half < 1) half = 1;
-
             amplitude = gA;  // hold at full amplitude
             slope = 0.0f;
             curve = 0.0f;
@@ -169,7 +164,6 @@ namespace project
             totalSamples = durSamples;
             samplesDone = 0;
             grainAmp = gA;
-
             if (durSamples < 2)
             {
                 amplitude = 0.f;
@@ -177,7 +171,6 @@ namespace project
                 finished = true;
                 return;
             }
-
             int half = durSamples / 2;
             if (half < 1) half = 1;
             amplitude = 0.f;
@@ -193,7 +186,6 @@ namespace project
             totalSamples = durSamples;
             samplesDone = 0;
             grainAmp = gA;
-
             if (durSamples < 2)
             {
                 amplitude = 0.f;
@@ -201,7 +193,6 @@ namespace project
                 finished = true;
                 return;
             }
-
             int half = durSamples / 2;
             if (half < 1) half = 1;
             amplitude = gA;
@@ -281,7 +272,6 @@ namespace project
             totalSamples = durSamples;
             samplesDone = 0;
             grainAmp = gA;
-
             if (durSamples < 2)
             {
                 amplitude = 0.f;
@@ -289,7 +279,6 @@ namespace project
                 finished = true;
                 return;
             }
-
             int attackSamples = (int)std::round((float)durSamples * attackRatio / (attackRatio + sustainRatio + releaseRatio));
             if (attackSamples < 1)
                 attackSamples = 1;
@@ -306,7 +295,6 @@ namespace project
             totalSamples = durSamples;
             samplesDone = 0;
             grainAmp = gA;
-
             if (durSamples < 2)
             {
                 amplitude = 0.f;
@@ -314,7 +302,6 @@ namespace project
                 finished = true;
                 return;
             }
-
             int attackSamples = (int)std::round((float)durSamples * attackRatio / (attackRatio + releaseRatio));
             if (attackSamples < 1)
                 attackSamples = 1;
@@ -382,31 +369,335 @@ namespace project
     };
 
     //==============================================================================
-    // Forward Declarations for Envelope Rendering Functions
+    // Templated Envelope Rendering Functions
+    //==============================================================================
+
+    // Parabolic envelope (templated on Punchy mode)
+    template <bool Punchy>
+    inline int vectorSynthesizeParabolicTemplated(struct Grain& grain,
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        auto& st = grain.parabState;
+        if (st.finished || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+        int processed = 0;
+        int remain = blockSize;
+        const float srl = (float)grain.sourceReadLength;
+        const float startOff = grain.essence.startOffsetInSamples;
+        const float pan = grain.essence.panning;
+        const float leftGain = 0.5f * (1.0f - pan);
+        const float rightGain = 0.5f * (1.0f + pan);
+        const float* srcL = grain.sourceL;
+        const float* srcR = grain.sourceR;
+        const float invTotal = (st.totalSamples > 0 ? 1.0f / st.totalSamples : 0.f);
+        float amp = st.amplitude;
+        float slope = st.slope;
+        float curve = st.curve;
+        int samplesDone = st.samplesDone;
+        int totalSamples = st.totalSamples;
+        int localBoundary = st.nextBoundary;
+        bool finishedFlag = st.finished;
+
+        while (remain > 0 && !finishedFlag)
+        {
+            int boundary = (remain < localBoundary ? remain : localBoundary);
+            for (int i = 0; i < boundary; ++i)
+            {
+                float env = amp;
+                if constexpr (Punchy)
+                {
+                    if (st.segmentIndex == 1)
+                    {
+                        amp += slope;
+                        slope += curve;
+                        env = amp;
+                    }
+                    else
+                    {
+                        env = st.finalAmplitude;
+                    }
+                }
+                else
+                {
+                    amp += slope;
+                    slope += curve;
+                }
+                float x = (totalSamples > 1 ? samplesDone * invTotal : 0.f);
+                float effPos = x * srl + startOff;
+                float sampleL = 0.f, sampleR = 0.f;
+                int idx0 = (int)effPos;
+                if (effPos >= 0.f && idx0 < bufferLength)
+                {
+                    int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
+                    float frac = effPos - (float)idx0;
+                    sampleL = srcL[idx0] + frac * (srcL[idx1] - srcL[idx0]);
+                    sampleR = srcR[idx0] + frac * (srcR[idx1] - srcR[idx0]);
+                }
+                sampleL *= (env * leftGain);
+                sampleR *= (env * rightGain);
+                outL[processed + i] += sampleL;
+                outR[processed + i] += sampleR;
+                ++samplesDone;
+                if (samplesDone >= totalSamples)
+                {
+                    finishedFlag = true;
+                    break;
+                }
+            }
+            remain -= boundary;
+            processed += boundary;
+            localBoundary -= boundary;
+            if (localBoundary <= 0 && !finishedFlag)
+            {
+                st.amplitude = amp;
+                st.slope = slope;
+                st.curve = curve;
+                st.samplesDone = samplesDone;
+                st.nextBoundary = localBoundary;
+                st.advanceSegment();
+                amp = st.amplitude;
+                slope = st.slope;
+                curve = st.curve;
+                samplesDone = st.samplesDone;
+                totalSamples = st.totalSamples;
+                localBoundary = st.nextBoundary;
+                finishedFlag = st.finished;
+            }
+        }
+        st.amplitude = amp;
+        st.slope = slope;
+        st.curve = curve;
+        st.samplesDone = samplesDone;
+        st.nextBoundary = localBoundary;
+        st.finished = finishedFlag;
+        if (finishedFlag)
+            grain.active = false;
+        return processed;
+    }
+
+    // Triangle envelope (templated on Punchy mode)
+    template <bool Punchy>
+    inline int vectorSynthesizeTriangleTemplated(struct Grain& grain,
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        auto& st = grain.linearState;
+        if (st.finished || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+        int processed = 0;
+        int remain = blockSize;
+        const float srl = (float)grain.sourceReadLength;
+        const float startOff = grain.essence.startOffsetInSamples;
+        const float pan = grain.essence.panning;
+        const float leftGain = 0.5f * (1.0f - pan);
+        const float rightGain = 0.5f * (1.0f + pan);
+        const float* srcL = grain.sourceL;
+        const float* srcR = grain.sourceR;
+        const float invTotal = (st.totalSamples > 0 ? 1.0f / st.totalSamples : 0.f);
+        float amp = st.amplitude;
+        float slope = st.slope;
+        int samplesDone = st.samplesDone;
+        int totalSamples = st.totalSamples;
+        int localBoundary = st.nextBoundary;
+        bool finishedFlag = st.finished;
+
+        while (remain > 0 && !finishedFlag)
+        {
+            int boundary = (remain < localBoundary ? remain : localBoundary);
+            for (int i = 0; i < boundary; ++i)
+            {
+                float env = amp;
+                if constexpr (Punchy)
+                {
+                    if (st.segmentIndex == 1)
+                        amp += slope;
+                }
+                else
+                {
+                    amp += slope;
+                }
+                float x = (totalSamples > 1 ? samplesDone * invTotal : 0.f);
+                float effPos = x * srl + startOff;
+                float sampleL = 0.f, sampleR = 0.f;
+                int idx0 = (int)effPos;
+                if (effPos >= 0.f && idx0 < bufferLength)
+                {
+                    int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
+                    float frac = effPos - (float)idx0;
+                    sampleL = srcL[idx0] + frac * (srcL[idx1] - srcL[idx0]);
+                    sampleR = srcR[idx0] + frac * (srcR[idx1] - srcR[idx0]);
+                }
+                outL[processed + i] += sampleL * (env * leftGain);
+                outR[processed + i] += sampleR * (env * rightGain);
+                ++samplesDone;
+                if (samplesDone >= totalSamples)
+                {
+                    finishedFlag = true;
+                    break;
+                }
+            }
+            remain -= boundary;
+            processed += boundary;
+            localBoundary -= boundary;
+            if (localBoundary <= 0 && !finishedFlag)
+            {
+                st.amplitude = amp;
+                st.slope = slope;
+                st.samplesDone = samplesDone;
+                st.nextBoundary = localBoundary;
+                st.advanceSegment();
+                amp = st.amplitude;
+                slope = st.slope;
+                samplesDone = st.samplesDone;
+                totalSamples = st.totalSamples;
+                localBoundary = st.nextBoundary;
+                finishedFlag = st.finished;
+            }
+        }
+        st.amplitude = amp;
+        st.slope = slope;
+        st.samplesDone = samplesDone;
+        st.nextBoundary = localBoundary;
+        st.finished = finishedFlag;
+        if (finishedFlag)
+            grain.active = false;
+        return processed;
+    }
+
+    // ASR envelope (templated on Punchy mode)
+    template <bool Punchy>
+    inline int vectorSynthesizeASRTemplated(struct Grain& grain,
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        auto& st = grain.asrState;
+        if (st.finished || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+        int processed = 0;
+        int remain = blockSize;
+        const float srl = (float)grain.sourceReadLength;
+        const float startOff = grain.essence.startOffsetInSamples;
+        const float pan = grain.essence.panning;
+        const float leftGain = 0.5f * (1.0f - pan);
+        const float rightGain = 0.5f * (1.0f + pan);
+        const float* srcL = grain.sourceL;
+        const float* srcR = grain.sourceR;
+        const float invTotal = (st.totalSamples > 0 ? 1.0f / st.totalSamples : 0.f);
+        float amp = st.amplitude;
+        float slope = st.slope;
+        int samplesDone = st.samplesDone;
+        int totalSamples = st.totalSamples;
+        int localBoundary = st.nextBoundary;
+        bool finishedFlag = st.finished;
+
+        while (remain > 0 && !finishedFlag)
+        {
+            int boundary = (remain < localBoundary ? remain : localBoundary);
+            for (int i = 0; i < boundary; ++i)
+            {
+                float env = amp;
+                if constexpr (Punchy)
+                {
+                    if (st.segmentIndex == 1)
+                        amp += slope;
+                }
+                else
+                {
+                    amp += slope;
+                }
+                float x = (totalSamples > 1 ? samplesDone * invTotal : 0.f);
+                float effPos = x * srl + startOff;
+                float sampleL = 0.f, sampleR = 0.f;
+                int idx0 = (int)effPos;
+                if (effPos >= 0.f && idx0 < bufferLength)
+                {
+                    int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
+                    float frac = effPos - (float)idx0;
+                    sampleL = srcL[idx0] + frac * (srcL[idx1] - srcL[idx0]);
+                    sampleR = srcR[idx0] + frac * (srcR[idx1] - srcR[idx0]);
+                }
+                outL[processed + i] += sampleL * (env * leftGain);
+                outR[processed + i] += sampleR * (env * rightGain);
+                ++samplesDone;
+                if (samplesDone >= totalSamples)
+                {
+                    finishedFlag = true;
+                    break;
+                }
+            }
+            remain -= boundary;
+            processed += boundary;
+            localBoundary -= boundary;
+            if (localBoundary <= 0 && !finishedFlag)
+            {
+                st.amplitude = amp;
+                st.slope = slope;
+                st.samplesDone = samplesDone;
+                st.nextBoundary = localBoundary;
+                st.advanceSegment();
+                amp = st.amplitude;
+                slope = st.slope;
+                samplesDone = st.samplesDone;
+                totalSamples = st.totalSamples;
+                localBoundary = st.nextBoundary;
+                finishedFlag = st.finished;
+            }
+        }
+        st.amplitude = amp;
+        st.slope = slope;
+        st.samplesDone = samplesDone;
+        st.nextBoundary = localBoundary;
+        st.finished = finishedFlag;
+        if (finishedFlag)
+            grain.active = false;
+        return processed;
+    }
+
+    //==============================================================================
+    // Non-templated wrappers for runtime dispatch
     //==============================================================================
     static int vectorSynthesizeParabolic(struct Grain& grain,
-        float* outL, float* outR,
-        int blockSize, int bufferLength);
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        return vectorSynthesizeParabolicTemplated<false>(grain, outL, outR, blockSize, bufferLength);
+    }
 
     static int vectorSynthesizePunchyParabolic(struct Grain& grain,
-        float* outL, float* outR,
-        int blockSize, int bufferLength);
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        return vectorSynthesizeParabolicTemplated<true>(grain, outL, outR, blockSize, bufferLength);
+    }
 
     static int vectorSynthesizeTriangle(struct Grain& grain,
-        float* outL, float* outR,
-        int blockSize, int bufferLength);
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        return vectorSynthesizeTriangleTemplated<false>(grain, outL, outR, blockSize, bufferLength);
+    }
 
     static int vectorSynthesizePunchyTriangle(struct Grain& grain,
-        float* outL, float* outR,
-        int blockSize, int bufferLength);
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        return vectorSynthesizeTriangleTemplated<true>(grain, outL, outR, blockSize, bufferLength);
+    }
 
     static int vectorSynthesizeASR(struct Grain& grain,
-        float* outL, float* outR,
-        int blockSize, int bufferLength);
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        return vectorSynthesizeASRTemplated<false>(grain, outL, outR, blockSize, bufferLength);
+    }
 
     static int vectorSynthesizePunchyASR(struct Grain& grain,
-        float* outL, float* outR,
-        int blockSize, int bufferLength);
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        return vectorSynthesizeASRTemplated<true>(grain, outL, outR, blockSize, bufferLength);
+    }
 
     //==============================================================================
     // Grain struct
@@ -490,553 +781,7 @@ namespace project
     };
 
     //==============================================================================
-    // Envelope Rendering Functions
-    //==============================================================================
-
-    // 1) Normal Parabolic
-    static int vectorSynthesizeParabolic(Grain& grain,
-        float* outL, float* outR,
-        int blockSize, int bufferLength)
-    {
-        auto& st = grain.parabState;
-        if (st.finished || !grain.active)
-        {
-            grain.active = false;
-            return 0;
-        }
-        int processed = 0;
-        int remain = blockSize;
-
-        const float srl = (float)grain.sourceReadLength;
-        const float startOff = grain.essence.startOffsetInSamples;
-        const float pan = grain.essence.panning;
-        const float leftGain = 0.5f * (1.0f - pan);
-        const float rightGain = 0.5f * (1.0f + pan);
-        const float* srcL = grain.sourceL;
-        const float* srcR = grain.sourceR;
-        const float invTotal = (st.totalSamples > 0 ? 1.0f / st.totalSamples : 0.f);
-
-        float amp = st.amplitude;
-        float slope = st.slope;
-        float curve = st.curve;
-        int samplesDone = st.samplesDone;
-        int totalSamples = st.totalSamples;
-        int localBoundary = st.nextBoundary;
-        bool finished = st.finished;
-
-        while (remain > 0 && !finished)
-        {
-            int boundary = (remain < localBoundary ? remain : localBoundary);
-            for (int i = 0; i < boundary; ++i)
-            {
-                float env = amp;
-                amp += slope;
-                slope += curve;
-                float x = (totalSamples > 1 ? samplesDone * invTotal : 0.f);
-                float effPos = x * srl + startOff;
-                float sampleL = 0.f, sampleR = 0.f;
-                int idx0 = (int)effPos;
-                if (effPos >= 0.f && idx0 < bufferLength)
-                {
-                    int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
-                    float frac = effPos - (float)idx0;
-                    sampleL = srcL[idx0] + frac * (srcL[idx1] - srcL[idx0]);
-                    sampleR = srcR[idx0] + frac * (srcR[idx1] - srcR[idx0]);
-                }
-                sampleL *= (env * leftGain);
-                sampleR *= (env * rightGain);
-                outL[processed + i] += sampleL;
-                outR[processed + i] += sampleR;
-                ++samplesDone;
-                if (samplesDone >= totalSamples)
-                {
-                    finished = true;
-                    break;
-                }
-            }
-            remain -= boundary;
-            processed += boundary;
-            localBoundary -= boundary;
-            if (localBoundary <= 0 && !finished)
-            {
-                st.amplitude = amp;
-                st.slope = slope;
-                st.curve = curve;
-                st.samplesDone = samplesDone;
-                st.nextBoundary = localBoundary;
-                st.advanceSegment();
-                amp = st.amplitude;
-                slope = st.slope;
-                curve = st.curve;
-                samplesDone = st.samplesDone;
-                totalSamples = st.totalSamples;
-                localBoundary = st.nextBoundary;
-                finished = st.finished;
-            }
-        }
-        st.amplitude = amp;
-        st.slope = slope;
-        st.curve = curve;
-        st.samplesDone = samplesDone;
-        st.nextBoundary = localBoundary;
-        st.finished = finished;
-        if (finished)
-            grain.active = false;
-        return processed;
-    }
-
-    // 2) Punchy Parabolic
-    static int vectorSynthesizePunchyParabolic(Grain& grain,
-        float* outL, float* outR,
-        int blockSize, int bufferLength)
-    {
-        auto& st = grain.parabState;
-        if (st.finished || !grain.active)
-        {
-            grain.active = false;
-            return 0;
-        }
-        int processed = 0;
-        int remain = blockSize;
-
-        const float srl = (float)grain.sourceReadLength;
-        const float startOff = grain.essence.startOffsetInSamples;
-        const float pan = grain.essence.panning;
-        const float leftGain = 0.5f * (1.0f - pan);
-        const float rightGain = 0.5f * (1.0f + pan);
-        const float* srcL = grain.sourceL;
-        const float* srcR = grain.sourceR;
-        const float invTotal = (st.totalSamples > 0 ? 1.0f / st.totalSamples : 0.f);
-
-        float amp = st.amplitude;
-        float slope = st.slope;
-        float curve = st.curve;
-        int samplesDone = st.samplesDone;
-        int totalSamples = st.totalSamples;
-        int localBoundary = st.nextBoundary;
-        bool finished = st.finished;
-        int segIndex = st.segmentIndex;
-
-        while (remain > 0 && !finished)
-        {
-            int boundary = (remain < localBoundary ? remain : localBoundary);
-            for (int i = 0; i < boundary; ++i)
-            {
-                float env = amp;
-                if (segIndex == 1)
-                {
-                    amp += slope;
-                    slope += curve;
-                    env = amp;
-                }
-                float x = (totalSamples > 1 ? samplesDone * invTotal : 0.f);
-                float effPos = x * srl + startOff;
-                float sampleL = 0.f, sampleR = 0.f;
-                int idx0 = (int)effPos;
-                if (effPos >= 0.f && idx0 < bufferLength)
-                {
-                    int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
-                    float frac = effPos - (float)idx0;
-                    sampleL = srcL[idx0] + frac * (srcL[idx1] - srcL[idx0]);
-                    sampleR = srcR[idx0] + frac * (srcR[idx1] - srcR[idx0]);
-                }
-                if (segIndex == 0)
-                    env = st.finalAmplitude;
-                sampleL *= (env * leftGain);
-                sampleR *= (env * rightGain);
-                outL[processed + i] += sampleL;
-                outR[processed + i] += sampleR;
-                ++samplesDone;
-                if (samplesDone >= totalSamples)
-                {
-                    finished = true;
-                    break;
-                }
-            }
-            remain -= boundary;
-            processed += boundary;
-            localBoundary -= boundary;
-            if (localBoundary <= 0 && !finished)
-            {
-                st.amplitude = amp;
-                st.slope = slope;
-                st.curve = curve;
-                st.samplesDone = samplesDone;
-                st.nextBoundary = localBoundary;
-                st.advanceSegment();
-                segIndex = st.segmentIndex;
-                amp = st.amplitude;
-                slope = st.slope;
-                curve = st.curve;
-                samplesDone = st.samplesDone;
-                totalSamples = st.totalSamples;
-                localBoundary = st.nextBoundary;
-                finished = st.finished;
-            }
-        }
-        st.amplitude = amp;
-        st.slope = slope;
-        st.curve = curve;
-        st.samplesDone = samplesDone;
-        st.nextBoundary = localBoundary;
-        st.finished = finished;
-        if (finished)
-            grain.active = false;
-        return processed;
-    }
-
-    // 3) Normal Triangle
-    static int vectorSynthesizeTriangle(Grain& grain,
-        float* outL, float* outR,
-        int blockSize, int bufferLength)
-    {
-        auto& st = grain.linearState;
-        if (st.finished || !grain.active)
-        {
-            grain.active = false;
-            return 0;
-        }
-        int processed = 0;
-        int remain = blockSize;
-
-        const float srl = (float)grain.sourceReadLength;
-        const float startOff = grain.essence.startOffsetInSamples;
-        const float pan = grain.essence.panning;
-        const float leftGain = 0.5f * (1.0f - pan);
-        const float rightGain = 0.5f * (1.0f + pan);
-        const float* srcL = grain.sourceL;
-        const float* srcR = grain.sourceR;
-        const float invTotal = (st.totalSamples > 0 ? 1.0f / st.totalSamples : 0.f);
-
-        float amp = st.amplitude;
-        float slope = st.slope;
-        int samplesDone = st.samplesDone;
-        int totalSamples = st.totalSamples;
-        int localBoundary = st.nextBoundary;
-        bool finished = st.finished;
-
-        while (remain > 0 && !finished)
-        {
-            int boundary = (remain < localBoundary ? remain : localBoundary);
-            for (int i = 0; i < boundary; ++i)
-            {
-                float env = amp;
-                amp += slope;
-                float x = (totalSamples > 1 ? samplesDone * invTotal : 0.f);
-                float effPos = x * srl + startOff;
-                float sampleL = 0.f, sampleR = 0.f;
-                int idx0 = (int)effPos;
-                if (effPos >= 0.f && idx0 < bufferLength)
-                {
-                    int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
-                    float frac = effPos - (float)idx0;
-                    sampleL = srcL[idx0] + frac * (srcL[idx1] - srcL[idx0]);
-                    sampleR = srcR[idx0] + frac * (srcR[idx1] - srcR[idx0]);
-                }
-                sampleL *= (env * leftGain);
-                sampleR *= (env * rightGain);
-                outL[processed + i] += sampleL;
-                outR[processed + i] += sampleR;
-                ++samplesDone;
-                if (samplesDone >= totalSamples)
-                {
-                    finished = true;
-                    break;
-                }
-            }
-            remain -= boundary;
-            processed += boundary;
-            localBoundary -= boundary;
-            if (localBoundary <= 0 && !finished)
-            {
-                st.amplitude = amp;
-                st.slope = slope;
-                st.samplesDone = samplesDone;
-                st.nextBoundary = localBoundary;
-                st.advanceSegment();
-                amp = st.amplitude;
-                slope = st.slope;
-                samplesDone = st.samplesDone;
-                totalSamples = st.totalSamples;
-                localBoundary = st.nextBoundary;
-                finished = st.finished;
-            }
-        }
-        st.amplitude = amp;
-        st.slope = slope;
-        st.samplesDone = samplesDone;
-        st.nextBoundary = localBoundary;
-        st.finished = finished;
-        if (finished)
-            grain.active = false;
-        return processed;
-    }
-
-    // 4) Punchy Triangle
-    static int vectorSynthesizePunchyTriangle(Grain& grain,
-        float* outL, float* outR,
-        int blockSize, int bufferLength)
-    {
-        auto& st = grain.linearState;
-        if (st.finished || !grain.active)
-        {
-            grain.active = false;
-            return 0;
-        }
-        int processed = 0;
-        int remain = blockSize;
-
-        const float srl = (float)grain.sourceReadLength;
-        const float startOff = grain.essence.startOffsetInSamples;
-        const float pan = grain.essence.panning;
-        const float leftGain = 0.5f * (1.0f - pan);
-        const float rightGain = 0.5f * (1.0f + pan);
-        const float* srcL = grain.sourceL;
-        const float* srcR = grain.sourceR;
-        const float invTotal = (st.totalSamples > 0 ? 1.0f / st.totalSamples : 0.f);
-
-        float amp = st.amplitude;
-        float slope = st.slope;
-        int samplesDone = st.samplesDone;
-        int totalSamples = st.totalSamples;
-        int localBoundary = st.nextBoundary;
-        bool finished = st.finished;
-
-        while (remain > 0 && !finished)
-        {
-            int boundary = (remain < localBoundary ? remain : localBoundary);
-            for (int i = 0; i < boundary; ++i)
-            {
-                float env = amp;
-                if (st.segmentIndex == 1)
-                    amp += slope;
-                float x = (totalSamples > 1 ? samplesDone * invTotal : 0.f);
-                float effPos = x * srl + startOff;
-                float sampleL = 0.f, sampleR = 0.f;
-                int idx0 = (int)effPos;
-                if (effPos >= 0.f && idx0 < bufferLength)
-                {
-                    int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
-                    float frac = effPos - (float)idx0;
-                    sampleL = srcL[idx0] + frac * (srcL[idx1] - srcL[idx0]);
-                    sampleR = srcR[idx0] + frac * (srcR[idx1] - srcR[idx0]);
-                }
-                sampleL *= (env * leftGain);
-                sampleR *= (env * rightGain);
-                outL[processed + i] += sampleL;
-                outR[processed + i] += sampleR;
-                ++samplesDone;
-                if (samplesDone >= totalSamples)
-                {
-                    finished = true;
-                    break;
-                }
-            }
-            remain -= boundary;
-            processed += boundary;
-            localBoundary -= boundary;
-            if (localBoundary <= 0 && !finished)
-            {
-                st.amplitude = amp;
-                st.slope = slope;
-                st.samplesDone = samplesDone;
-                st.nextBoundary = localBoundary;
-                st.advanceSegment();
-                amp = st.amplitude;
-                slope = st.slope;
-                samplesDone = st.samplesDone;
-                totalSamples = st.totalSamples;
-                localBoundary = st.nextBoundary;
-                finished = st.finished;
-            }
-        }
-        st.amplitude = amp;
-        st.slope = slope;
-        st.samplesDone = samplesDone;
-        st.nextBoundary = localBoundary;
-        st.finished = finished;
-        if (finished)
-            grain.active = false;
-        return processed;
-    }
-
-    // 5) Normal ASR
-    static int vectorSynthesizeASR(Grain& grain,
-        float* outL, float* outR,
-        int blockSize, int bufferLength)
-    {
-        auto& st = grain.asrState;
-        if (st.finished || !grain.active)
-        {
-            grain.active = false;
-            return 0;
-        }
-        int processed = 0;
-        int remain = blockSize;
-
-        const float srl = (float)grain.sourceReadLength;
-        const float startOff = grain.essence.startOffsetInSamples;
-        const float pan = grain.essence.panning;
-        const float leftGain = 0.5f * (1.0f - pan);
-        const float rightGain = 0.5f * (1.0f + pan);
-        const float* srcL = grain.sourceL;
-        const float* srcR = grain.sourceR;
-        const float invTotal = (st.totalSamples > 0 ? 1.0f / st.totalSamples : 0.f);
-
-        float amp = st.amplitude;
-        float slope = st.slope;
-        int samplesDone = st.samplesDone;
-        int totalSamples = st.totalSamples;
-        int localBoundary = st.nextBoundary;
-        bool finished = st.finished;
-
-        while (remain > 0 && !finished)
-        {
-            int boundary = (remain < localBoundary ? remain : localBoundary);
-            for (int i = 0; i < boundary; ++i)
-            {
-                float env = amp;
-                amp += slope;
-                float x = (totalSamples > 1 ? samplesDone * invTotal : 0.f);
-                float effPos = x * srl + startOff;
-                float sampleL = 0.f, sampleR = 0.f;
-                int idx0 = (int)effPos;
-                if (effPos >= 0.f && idx0 < bufferLength)
-                {
-                    int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
-                    float frac = effPos - (float)idx0;
-                    sampleL = srcL[idx0] + frac * (srcL[idx1] - srcL[idx0]);
-                    sampleR = srcR[idx0] + frac * (srcR[idx1] - srcR[idx0]);
-                }
-                sampleL *= (env * leftGain);
-                sampleR *= (env * rightGain);
-                outL[processed + i] += sampleL;
-                outR[processed + i] += sampleR;
-                ++samplesDone;
-                if (samplesDone >= totalSamples)
-                {
-                    finished = true;
-                    break;
-                }
-            }
-            remain -= boundary;
-            processed += boundary;
-            localBoundary -= boundary;
-            if (localBoundary <= 0 && !finished)
-            {
-                st.amplitude = amp;
-                st.slope = slope;
-                st.samplesDone = samplesDone;
-                st.nextBoundary = localBoundary;
-                st.advanceSegment();
-                amp = st.amplitude;
-                slope = st.slope;
-                samplesDone = st.samplesDone;
-                totalSamples = st.totalSamples;
-                localBoundary = st.nextBoundary;
-                finished = st.finished;
-            }
-        }
-        st.amplitude = amp;
-        st.slope = slope;
-        st.samplesDone = samplesDone;
-        st.nextBoundary = localBoundary;
-        st.finished = finished;
-        if (finished)
-            grain.active = false;
-        return processed;
-    }
-
-    // 6) Punchy ASR
-    static int vectorSynthesizePunchyASR(Grain& grain,
-        float* outL, float* outR,
-        int blockSize, int bufferLength)
-    {
-        auto& st = grain.asrState;
-        if (st.finished || !grain.active)
-        {
-            grain.active = false;
-            return 0;
-        }
-        int processed = 0;
-        int remain = blockSize;
-
-        const float srl = (float)grain.sourceReadLength;
-        const float startOff = grain.essence.startOffsetInSamples;
-        const float pan = grain.essence.panning;
-        const float leftGain = 0.5f * (1.0f - pan);
-        const float rightGain = 0.5f * (1.0f + pan);
-        const float* srcL = grain.sourceL;
-        const float* srcR = grain.sourceR;
-        const float invTotal = (st.totalSamples > 0 ? 1.0f / st.totalSamples : 0.f);
-
-        float amp = st.amplitude;
-        float slope = st.slope;
-        int samplesDone = st.samplesDone;
-        int totalSamples = st.totalSamples;
-        int localBoundary = st.nextBoundary;
-        bool finished = st.finished;
-
-        while (remain > 0 && !finished)
-        {
-            int boundary = (remain < localBoundary ? remain : localBoundary);
-            for (int i = 0; i < boundary; ++i)
-            {
-                float env = amp;
-                if (st.segmentIndex == 1)
-                    amp += slope;
-                float x = (totalSamples > 1 ? samplesDone * invTotal : 0.f);
-                float effPos = x * srl + startOff;
-                float sampleL = 0.f, sampleR = 0.f;
-                int idx0 = (int)effPos;
-                if (effPos >= 0.f && idx0 < bufferLength)
-                {
-                    int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
-                    float frac = effPos - (float)idx0;
-                    sampleL = srcL[idx0] + frac * (srcL[idx1] - srcL[idx0]);
-                    sampleR = srcR[idx0] + frac * (srcR[idx1] - srcR[idx0]);
-                }
-                sampleL *= (env * leftGain);
-                sampleR *= (env * rightGain);
-                outL[processed + i] += sampleL;
-                outR[processed + i] += sampleR;
-                ++samplesDone;
-                if (samplesDone >= totalSamples)
-                {
-                    finished = true;
-                    break;
-                }
-            }
-            remain -= boundary;
-            processed += boundary;
-            localBoundary -= boundary;
-            if (localBoundary <= 0 && !finished)
-            {
-                st.amplitude = amp;
-                st.slope = slope;
-                st.samplesDone = samplesDone;
-                st.nextBoundary = localBoundary;
-                st.advanceSegment();
-                amp = st.amplitude;
-                slope = st.slope;
-                samplesDone = st.samplesDone;
-                totalSamples = st.totalSamples;
-                localBoundary = st.nextBoundary;
-                finished = st.finished;
-            }
-        }
-        st.amplitude = amp;
-        st.slope = slope;
-        st.samplesDone = samplesDone;
-        st.nextBoundary = localBoundary;
-        st.finished = finished;
-        if (finished)
-            grain.active = false;
-        return processed;
-    }
-
-    //==============================================================================
-    // Scheduling Functions
+    // Scheduling Functions (unchanged)
     //==============================================================================
     struct Granular_Synth_2_Helper
     {
@@ -1138,7 +883,7 @@ namespace project
         Grain::EnvelopeFunction);
 
     //==============================================================================
-    // Granular_Synth_2 Class Template
+    // Granular_Synth Class Template (SNEX node unchanged)
     //==============================================================================
     template <int NV>
     struct Granular_Synth : public data::base
@@ -1237,32 +982,22 @@ namespace project
         std::vector<float> tempBlockOutR;
 
         // Optimized reflection function.
-        // This function assumes that in the common case, the offset is within one double-length (2*bufferLen).
-        // If not, we fall back to std::fmod.
         inline static float reflectOffset(float offset, float bufferLen)
         {
             const float doubleLen = 2.0f * bufferLen;
-
-            // Fast-path: if offset is already in the range [-doubleLen, doubleLen]
             if (offset > -doubleLen && offset < doubleLen)
             {
-                // Make sure offset is non-negative.
                 if (offset < 0.0f)
                     offset += doubleLen;
             }
             else
             {
-                // Fall back to modulo for out-of-range values.
                 offset = std::fmod(offset, doubleLen);
                 if (offset < 0.0f)
                     offset += doubleLen;
             }
-
-            // Reflect if offset exceeds bufferLen.
-            // (For values between bufferLen and doubleLen, we map them back down.)
             if (offset > bufferLen)
                 offset = doubleLen - offset;
-
             return offset;
         }
 
@@ -1287,7 +1022,6 @@ namespace project
         {
             grainSizeInSamples = (int)std::lround((grainSizeMS / 1000.0) * sampleRate);
             grainIntervalInSamples = (int)std::lround((grainIntervalMS / 1000.0) * sampleRate);
-            // Use the sample's file sample rate from ExternalData (if available) instead of 44100
             sampleRateRatio = (sampleData.sampleRate > 0 ? sampleData.sampleRate : 44100.0) / sampleRate;
             globalPitchOffsetFactor = std::pow(2.0, grainPitchOffsetSemitones / 12.0);
             int currentSampleLength = sampleBuffer.getNumSamples();
@@ -1329,7 +1063,6 @@ namespace project
             AudioSampleBuffer tempBuffer = ed.toAudioSampleBuffer();
             int numSamples = tempBuffer.getNumSamples();
             int numChannels = tempBuffer.getNumChannels();
-
             if (numSamples <= 0)
             {
                 static AudioBuffer<float> safetyBuffer(2, 4);
@@ -1340,13 +1073,11 @@ namespace project
             {
                 sampleBuffer.makeCopyOf(tempBuffer, true);
             }
-
             sample[0] = sampleBuffer.getReadPointer(0);
             if (numChannels > 1)
                 sample[1] = sampleBuffer.getReadPointer(1);
             else
                 sample[1] = sample[0];
-
             updateDerivedParameters();
         }
 
@@ -1391,10 +1122,8 @@ namespace project
             const int sampleLen = sampleBuffer.getNumSamples();
             int globalOffset = 0;
 
-            // Main processing loop: process a segment of the output until we complete the block.
             while (globalOffset < totalSamples)
             {
-                // Determine the next event time (in samples) across all voices.
                 int nextEvent = totalSamples - globalOffset;
                 for (auto& voice : voices)
                 {
@@ -1421,11 +1150,9 @@ namespace project
                 if (nextEvent < 1)
                     nextEvent = 1;
 
-                // Clear temporary buffers for the current segment.
                 std::fill(tempBlockOutL.begin(), tempBlockOutL.begin() + nextEvent, 0.f);
                 std::fill(tempBlockOutR.begin(), tempBlockOutR.begin() + nextEvent, 0.f);
 
-                // Synthesize active grains for the current segment.
                 for (auto& voice : voices)
                 {
                     if (!voice.isActive)
@@ -1448,20 +1175,17 @@ namespace project
                     }
                 }
 
-                // Mix the synthesized segment into the output channels.
                 for (int i = 0; i < nextEvent; ++i)
                 {
                     leftChannel[globalOffset + i] += tempBlockOutL[i];
                     rightChannel[globalOffset + i] += tempBlockOutR[i];
                 }
 
-                // Interleaved grain scheduling: update each voice's scheduler counter and activate new grains if due.
                 for (auto& voice : voices)
                 {
                     if (!voice.isActive)
                         continue;
                     voice.grainSchedulerCounter -= nextEvent;
-                    // If the scheduler counter has expired, schedule new grains immediately.
                     while (voice.grainSchedulerCounter <= 0)
                     {
                         double baseDelta = pitchRatios[voice.midiNote] * sampleRateRatio * globalPitchOffsetFactor;
@@ -1538,7 +1262,6 @@ namespace project
                         voice.grainSchedulerCounter += (grainIntervalInSamples + essence.gapAdjustment);
                     }
                 }
-
                 globalOffset += nextEvent;
             }
         }
