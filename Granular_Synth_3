@@ -16,796 +16,852 @@ namespace project
 #define M_PI 3.14159265358979323846
 #endif
 
-using namespace juce;
-using namespace hise;
-using namespace scriptnode;
+    using namespace juce;
+    using namespace hise;
+    using namespace scriptnode;
 
-//==============================================================================
-// EnvelopeMode: (for clarity; runtime shape is chosen via function pointers)
-//==============================================================================
-enum class EnvelopeMode
-{
-    Parabolic,
-    Triangle,
-    ASR // (Punchy is treated as a modifier)
-};
-
-//==============================================================================
-// GrainEssence: Randomized per-grain parameters computed on activation.
-//==============================================================================
-struct GrainEssence
-{
-    double pitchOffsetCents = 0.0;
-    float  volumeMult = 1.0f;
-    float  panning = 0.0f;
-    int    gapAdjustment = 0;
-    float  sizeMult = 1.0f;
-    float  startOffsetInSamples = 0.0f;
-};
-
-//==============================================================================
-// Envelope state structs with boundary hoisting as per the paper.
-//==============================================================================
-
-//---------------------------------------------------------------
-// Parabolic envelope state
-//---------------------------------------------------------------
-struct ParabolicEnvelopeState
-{
-    float amplitude = 0.0f;
-    float slope = 0.0f;
-    float curve = 0.0f;
-    bool finished = false;
-    int totalSamples = 0;
-    int samplesDone = 0;
-    bool isPunchy = false;
-    int segmentIndex = 0;
-    int nextBoundaryVal = 0;  // samples until next boundary
-    float finalAmplitude = 0.0f;  // used for punchy mode
-
-    void initNormal(float gA, int durSamples)
+    //==============================================================================
+    // Helper functions for power-of-two calculations
+    //==============================================================================
+    inline bool isPowerOfTwo(int x)
     {
-        finished = false;
-        totalSamples = durSamples;
-        samplesDone = 0;
-        isPunchy = false;
-        segmentIndex = 0;
-        if (durSamples < 1)
+        return (x > 0) && ((x & (x - 1)) == 0);
+    }
+
+    inline int nextPowerOfTwo(int x)
+    {
+        if (x < 1)
+            return 1;
+        x--;
+        x |= x >> 1;
+        x |= x >> 2;
+        x |= x >> 4;
+        x |= x >> 8;
+        x |= x >> 16;
+        return x + 1;
+    }
+
+    //==============================================================================
+    // EnvelopeMode: (for clarity; runtime shape is chosen via function pointers)
+    //==============================================================================
+    enum class EnvelopeMode
+    {
+        Parabolic,
+        Triangle,
+        ASR // (Punchy is treated as a modifier)
+    };
+
+    //==============================================================================
+    // GrainEssence: Randomized per-grain parameters computed on activation.
+    //==============================================================================
+    struct GrainEssence
+    {
+        double pitchOffsetCents = 0.0;
+        float  volumeMult = 1.0f;
+        float  panning = 0.0f;
+        int    gapAdjustment = 0;
+        float  sizeMult = 1.0f;
+        float  startOffsetInSamples = 0.0f;
+    };
+
+    //==============================================================================
+    // Envelope state structs with boundary hoisting as per the paper.
+    //==============================================================================
+
+    //---------------------------------------------------------------
+    // Parabolic envelope state
+    //---------------------------------------------------------------
+    struct ParabolicEnvelopeState
+    {
+        float amplitude = 0.0f;
+        float slope = 0.0f;
+        float curve = 0.0f;
+        bool finished = false;
+        int totalSamples = 0;
+        int samplesDone = 0;
+        bool isPunchy = false;
+        int segmentIndex = 0;
+        int nextBoundaryVal = 0;  // samples until next boundary
+        float finalAmplitude = 0.0f;  // used for punchy mode
+
+        void initNormal(float gA, int durSamples)
         {
-            amplitude = 0.0f; slope = 0.0f; curve = 0.0f;
-            finished = true;
-            return;
+            finished = false;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            isPunchy = false;
+            segmentIndex = 0;
+            if (durSamples < 1)
+            {
+                amplitude = 0.0f; slope = 0.0f; curve = 0.0f;
+                finished = true;
+                return;
+            }
+            amplitude = 0.0f;
+            double rdur = 1.0 / double(durSamples);
+            double rdur2 = rdur * rdur;
+            slope = float(4.0 * double(gA) * (rdur - rdur2));
+            curve = float(-8.0 * double(gA) * rdur2);
+            nextBoundaryVal = durSamples; // entire envelope is one segment
         }
-        amplitude = 0.0f;
-        double rdur = 1.0 / double(durSamples);
-        double rdur2 = rdur * rdur;
-        slope = float(4.0 * double(gA) * (rdur - rdur2));
-        curve = float(-8.0 * double(gA) * rdur2);
-        nextBoundaryVal = durSamples; // entire envelope is one segment
-    }
 
-    void initPunchy(float gA, int durSamples)
-    {
-        finished = false;
-        totalSamples = durSamples;
-        samplesDone = 0;
-        isPunchy = true;
-        segmentIndex = 0;
-        finalAmplitude = gA;
-        if (durSamples < 2)
+        void initPunchy(float gA, int durSamples)
         {
-            amplitude = 0.0f; slope = 0.0f; curve = 0.0f;
-            finished = true;
-            return;
-        }
-        int half = durSamples / 2;
-        if (half < 1)
-            half = 1;
-        amplitude = gA; // first segment holds full amplitude
-        slope = 0.0f;
-        curve = 0.0f;
-        nextBoundaryVal = half;
-    }
-
-    // Returns the minimum of the provided maximum and nextBoundaryVal.
-    int nextBoundary(int maximum) const
-    {
-        return std::min(maximum, nextBoundaryVal);
-    }
-
-    // Compute one envelope sample without boundary check.
-    float synthesize()
-    {
-        float current = amplitude;
-        amplitude += slope;
-        slope += curve;
-        ++samplesDone;
-        return current;
-    }
-
-    // After processing a block, update nextBoundaryVal and, if needed, advance the envelope.
-    void checkBoundary(int samplesPassed)
-    {
-        nextBoundaryVal -= samplesPassed;
-        if (nextBoundaryVal <= 0 && !finished)
-            advanceSegment();
-    }
-
-    bool atEnd() const { return finished; }
-
-    inline void advanceSegment()
-    {
-        if (!isPunchy)
-        {
-            finished = true;
-            return;
-        }
-        if (segmentIndex == 0)
-        {
-            segmentIndex = 1;
-            int half = totalSamples - (totalSamples / 2);
+            finished = false;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            isPunchy = true;
+            segmentIndex = 0;
+            finalAmplitude = gA;
+            if (durSamples < 2)
+            {
+                amplitude = 0.0f; slope = 0.0f; curve = 0.0f;
+                finished = true;
+                return;
+            }
+            int half = durSamples / 2;
             if (half < 1)
+                half = 1;
+            amplitude = gA; // first segment holds full amplitude
+            slope = 0.0f;
+            curve = 0.0f;
+            nextBoundaryVal = half;
+        }
+
+        int nextBoundary(int maximum) const
+        {
+            return std::min(maximum, nextBoundaryVal);
+        }
+
+        float synthesize()
+        {
+            float current = amplitude;
+            amplitude += slope;
+            slope += curve;
+            ++samplesDone;
+            return current;
+        }
+
+        void checkBoundary(int samplesPassed)
+        {
+            nextBoundaryVal -= samplesPassed;
+            if (nextBoundaryVal <= 0 && !finished)
+                advanceSegment();
+        }
+
+        bool atEnd() const { return finished; }
+
+        inline void advanceSegment()
+        {
+            if (!isPunchy)
             {
                 finished = true;
                 return;
             }
-            const float H = (float)half;
-            slope = -finalAmplitude / (H * H);
-            curve = -(2.0f * finalAmplitude) / (H * H);
+            if (segmentIndex == 0)
+            {
+                segmentIndex = 1;
+                int half = totalSamples - (totalSamples / 2);
+                if (half < 1)
+                {
+                    finished = true;
+                    return;
+                }
+                const float H = static_cast<float>(half);
+                slope = -finalAmplitude / (H * H);
+                curve = -(2.0f * finalAmplitude) / (H * H);
+                nextBoundaryVal = half;
+            }
+            else
+            {
+                finished = true;
+            }
+        }
+    };
+
+    //---------------------------------------------------------------
+    // Linear (Triangle) envelope state
+    //---------------------------------------------------------------
+    struct LinearEnvelopeState
+    {
+        float amplitude = 0.0f;
+        float slope = 0.0f;
+        bool finished = false;
+        bool isPunchy = false;
+        int segmentIndex = 0;
+        int totalSamples = 0;
+        int samplesDone = 0;
+        int nextBoundaryVal = 0;
+        float grainAmp = 0.0f;
+
+        void initNormal(float gA, int durSamples)
+        {
+            finished = false;
+            isPunchy = false;
+            segmentIndex = 0;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            grainAmp = gA;
+            if (durSamples < 2)
+            {
+                amplitude = 0.f; slope = 0.f;
+                finished = true;
+                return;
+            }
+            int half = durSamples / 2;
+            if (half < 1)
+                half = 1;
+            amplitude = 0.f;
+            slope = gA / static_cast<float>(half);
             nextBoundaryVal = half;
         }
-        else
+
+        void initPunchy(float gA, int durSamples)
         {
-            finished = true;
-        }
-    }
-};
-
-//---------------------------------------------------------------
-// Linear (Triangle) envelope state
-//---------------------------------------------------------------
-struct LinearEnvelopeState
-{
-    float amplitude = 0.0f;
-    float slope = 0.0f;
-    bool finished = false;
-    bool isPunchy = false;
-    int segmentIndex = 0;
-    int totalSamples = 0;
-    int samplesDone = 0;
-    int nextBoundaryVal = 0;
-    float grainAmp = 0.0f;
-
-    void initNormal(float gA, int durSamples)
-    {
-        finished = false;
-        isPunchy = false;
-        segmentIndex = 0;
-        totalSamples = durSamples;
-        samplesDone = 0;
-        grainAmp = gA;
-        if (durSamples < 2)
-        {
-            amplitude = 0.f; slope = 0.f;
-            finished = true;
-            return;
-        }
-        int half = durSamples / 2;
-        if (half < 1)
-            half = 1;
-        amplitude = 0.f;
-        slope = gA / (float)half;
-        nextBoundaryVal = half;
-    }
-
-    void initPunchy(float gA, int durSamples)
-    {
-        finished = false;
-        isPunchy = true;
-        segmentIndex = 0;
-        totalSamples = durSamples;
-        samplesDone = 0;
-        grainAmp = gA;
-        if (durSamples < 2)
-        {
-            amplitude = gA; slope = 0.f;
-            finished = true;
-            return;
-        }
-        int half = durSamples / 2;
-        if (half < 1)
-            half = 1;
-        amplitude = gA;
-        slope = 0.f;
-        nextBoundaryVal = half;
-    }
-
-    int nextBoundary(int maximum) const
-    {
-        return std::min(maximum, nextBoundaryVal);
-    }
-
-    float synthesize()
-    {
-        float current = amplitude;
-        amplitude += slope;
-        ++samplesDone;
-        return current;
-    }
-
-    void checkBoundary(int samplesPassed)
-    {
-        nextBoundaryVal -= samplesPassed;
-        if (nextBoundaryVal <= 0 && !finished)
-            advanceSegment();
-    }
-
-    bool atEnd() const { return finished; }
-
-    inline void advanceSegment()
-    {
-        if (!isPunchy)
-        {
-            if (segmentIndex == 0)
+            finished = false;
+            isPunchy = true;
+            segmentIndex = 0;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            grainAmp = gA;
+            if (durSamples < 2)
             {
-                segmentIndex = 1;
-                int half = totalSamples - (totalSamples / 2);
-                if (half < 1)
+                amplitude = gA; slope = 0.f;
+                finished = true;
+                return;
+            }
+            int half = durSamples / 2;
+            if (half < 1)
+                half = 1;
+            amplitude = gA;
+            slope = 0.f;
+            nextBoundaryVal = half;
+        }
+
+        int nextBoundary(int maximum) const
+        {
+            return std::min(maximum, nextBoundaryVal);
+        }
+
+        float synthesize()
+        {
+            float current = amplitude;
+            amplitude += slope;
+            ++samplesDone;
+            return current;
+        }
+
+        void checkBoundary(int samplesPassed)
+        {
+            nextBoundaryVal -= samplesPassed;
+            if (nextBoundaryVal <= 0 && !finished)
+                advanceSegment();
+        }
+
+        bool atEnd() const { return finished; }
+
+        inline void advanceSegment()
+        {
+            if (!isPunchy)
+            {
+                if (segmentIndex == 0)
+                {
+                    segmentIndex = 1;
+                    int half = totalSamples - (totalSamples / 2);
+                    if (half < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
+                    amplitude = grainAmp;
+                    slope = (0.f - grainAmp) / static_cast<float>(half);
+                    nextBoundaryVal = half;
+                }
+                else
                 {
                     finished = true;
-                    return;
                 }
-                amplitude = grainAmp;
-                slope = (0.f - grainAmp) / (float)half;
-                nextBoundaryVal = half;
             }
             else
             {
-                finished = true;
-            }
-        }
-        else
-        {
-            if (segmentIndex == 0)
-            {
-                segmentIndex = 1;
-                int half = totalSamples - (totalSamples / 2);
-                if (half < 1)
+                if (segmentIndex == 0)
+                {
+                    segmentIndex = 1;
+                    int half = totalSamples - (totalSamples / 2);
+                    if (half < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
+                    slope = (0.f - amplitude) / static_cast<float>(half);
+                    nextBoundaryVal = half;
+                }
+                else
                 {
                     finished = true;
-                    return;
                 }
-                slope = (0.f - amplitude) / (float)half;
-                nextBoundaryVal = half;
+            }
+        }
+    };
+
+    //---------------------------------------------------------------
+    // ASR envelope state
+    //---------------------------------------------------------------
+    struct ASREnvelopeState
+    {
+        float amplitude = 0.0f;
+        float slope = 0.0f;
+        bool finished = false;
+        bool isPunchy = false;
+        int segmentIndex = 0;
+        int totalSamples = 0;
+        int samplesDone = 0;
+        int nextBoundaryVal = 0;
+        float grainAmp = 0.0f;
+        float attackRatio = 3.f;
+        float sustainRatio = 10.f;
+        float releaseRatio = 11.f;
+
+        void initNormal(float gA, int durSamples)
+        {
+            finished = false;
+            isPunchy = false;
+            segmentIndex = 0;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            grainAmp = gA;
+            if (durSamples < 2)
+            {
+                amplitude = 0.f; slope = 0.f;
+                finished = true;
+                return;
+            }
+            int attackSamples = static_cast<int>(std::round(static_cast<float>(durSamples) * attackRatio / (attackRatio + sustainRatio + releaseRatio)));
+            if (attackSamples < 1) attackSamples = 1;
+            amplitude = 0.f;
+            slope = gA / static_cast<float>(attackSamples);
+            nextBoundaryVal = attackSamples;
+        }
+
+        void initPunchy(float gA, int durSamples)
+        {
+            finished = false;
+            isPunchy = true;
+            segmentIndex = 0;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            grainAmp = gA;
+            if (durSamples < 2)
+            {
+                amplitude = gA; slope = 0.f;
+                finished = true;
+                return;
+            }
+            int attackSamples = static_cast<int>(std::round(static_cast<float>(durSamples) * attackRatio / (attackRatio + releaseRatio)));
+            if (attackSamples < 1) attackSamples = 1;
+            amplitude = gA;
+            slope = 0.f;
+            nextBoundaryVal = attackSamples;
+        }
+
+        int nextBoundary(int maximum) const
+        {
+            return std::min(maximum, nextBoundaryVal);
+        }
+
+        float synthesize()
+        {
+            float current = amplitude;
+            amplitude += slope;
+            ++samplesDone;
+            return current;
+        }
+
+        void checkBoundary(int samplesPassed)
+        {
+            nextBoundaryVal -= samplesPassed;
+            if (nextBoundaryVal <= 0 && !finished)
+                advanceSegment();
+        }
+
+        bool atEnd() const { return finished; }
+
+        inline void advanceSegment()
+        {
+            if (!isPunchy)
+            {
+                if (segmentIndex == 0) // Attack -> Sustain
+                {
+                    segmentIndex = 1;
+                    int sustainSamples = static_cast<int>(std::round(static_cast<float>(totalSamples) * sustainRatio / (attackRatio + sustainRatio + releaseRatio)));
+                    if (sustainSamples < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
+                    amplitude = grainAmp;
+                    slope = 0.f;
+                    nextBoundaryVal = sustainSamples;
+                }
+                else if (segmentIndex == 1) // Sustain -> Release
+                {
+                    segmentIndex = 2;
+                    int releaseSamples = totalSamples - static_cast<int>(std::round(static_cast<float>(totalSamples) * (attackRatio + sustainRatio) / (attackRatio + sustainRatio + releaseRatio)));
+                    if (releaseSamples < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
+                    amplitude = grainAmp;
+                    slope = (0.f - grainAmp) / static_cast<float>(releaseSamples);
+                    nextBoundaryVal = releaseSamples;
+                }
+                else
+                {
+                    finished = true;
+                }
             }
             else
             {
-                finished = true;
-            }
-        }
-    }
-};
-
-//---------------------------------------------------------------
-// ASR envelope state
-//---------------------------------------------------------------
-struct ASREnvelopeState
-{
-    float amplitude = 0.0f;
-    float slope = 0.0f;
-    bool finished = false;
-    bool isPunchy = false;
-    int segmentIndex = 0;
-    int totalSamples = 0;
-    int samplesDone = 0;
-    int nextBoundaryVal = 0;
-    float grainAmp = 0.0f;
-    float attackRatio = 3.f;
-    float sustainRatio = 10.f;
-    float releaseRatio = 11.f;
-
-    void initNormal(float gA, int durSamples)
-    {
-        finished = false;
-        isPunchy = false;
-        segmentIndex = 0;
-        totalSamples = durSamples;
-        samplesDone = 0;
-        grainAmp = gA;
-        if (durSamples < 2)
-        {
-            amplitude = 0.f; slope = 0.f;
-            finished = true;
-            return;
-        }
-        int attackSamples = (int)std::round((float)durSamples * attackRatio / (attackRatio + sustainRatio + releaseRatio));
-        if (attackSamples < 1) attackSamples = 1;
-        amplitude = 0.f;
-        slope = gA / (float)attackSamples;
-        nextBoundaryVal = attackSamples;
-    }
-
-    void initPunchy(float gA, int durSamples)
-    {
-        finished = false;
-        isPunchy = true;
-        segmentIndex = 0;
-        totalSamples = durSamples;
-        samplesDone = 0;
-        grainAmp = gA;
-        if (durSamples < 2)
-        {
-            amplitude = gA; slope = 0.f;
-            finished = true;
-            return;
-        }
-        int attackSamples = (int)std::round((float)durSamples * attackRatio / (attackRatio + releaseRatio));
-        if (attackSamples < 1) attackSamples = 1;
-        amplitude = gA;
-        slope = 0.f;
-        nextBoundaryVal = attackSamples;
-    }
-
-    int nextBoundary(int maximum) const
-    {
-        return std::min(maximum, nextBoundaryVal);
-    }
-
-    float synthesize()
-    {
-        float current = amplitude;
-        amplitude += slope;
-        ++samplesDone;
-        return current;
-    }
-
-    void checkBoundary(int samplesPassed)
-    {
-        nextBoundaryVal -= samplesPassed;
-        if (nextBoundaryVal <= 0 && !finished)
-            advanceSegment();
-    }
-
-    bool atEnd() const { return finished; }
-
-    inline void advanceSegment()
-    {
-        if (!isPunchy)
-        {
-            if (segmentIndex == 0) // Attack -> Sustain
-            {
-                segmentIndex = 1;
-                int sustainSamples = (int)std::round((float)totalSamples * sustainRatio / (attackRatio + sustainRatio + releaseRatio));
-                if (sustainSamples < 1)
+                if (segmentIndex == 0) // Attack -> Release
+                {
+                    segmentIndex = 1;
+                    int releaseSamples = totalSamples - static_cast<int>(std::round(static_cast<float>(totalSamples) * attackRatio / (attackRatio + releaseRatio)));
+                    if (releaseSamples < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
+                    amplitude = grainAmp;
+                    slope = (0.f - amplitude) / static_cast<float>(releaseSamples);
+                    nextBoundaryVal = releaseSamples;
+                }
+                else
                 {
                     finished = true;
-                    return;
                 }
-                amplitude = grainAmp;
-                slope = 0.f;
-                nextBoundaryVal = sustainSamples;
-            }
-            else if (segmentIndex == 1) // Sustain -> Release
-            {
-                segmentIndex = 2;
-                int releaseSamples = totalSamples - (int)std::round((float)totalSamples * (attackRatio + sustainRatio) / (attackRatio + sustainRatio + releaseRatio));
-                if (releaseSamples < 1)
-                {
-                    finished = true;
-                    return;
-                }
-                amplitude = grainAmp;
-                slope = (0.f - grainAmp) / (float)releaseSamples;
-                nextBoundaryVal = releaseSamples;
-            }
-            else
-            {
-                finished = true;
             }
         }
-        else
+    };
+
+    //==============================================================================
+    // Templated Envelope Rendering Functions following the paper's pseudocode.
+    // Each function processes a block of samples without per-sample branch checks,
+    // then calls checkBoundary() once after the block. This version precomputes a 
+    // "contiguous" flag and constant multipliers, and replaces std::floor with a simple int cast,
+    // since we assume effPos is never negative.
+    //==============================================================================
+    template <bool Punchy>
+    inline int vectorSynthesizeParabolicTemplated(struct Grain& grain,
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        auto& st = grain.parabState;
+        if (st.atEnd() || !grain.active)
         {
-            if (segmentIndex == 0) // Attack -> Release
-            {
-                segmentIndex = 1;
-                int releaseSamples = totalSamples - (int)std::round((float)totalSamples * attackRatio / (attackRatio + releaseRatio));
-                if (releaseSamples < 1)
-                {
-                    finished = true;
-                    return;
-                }
-                amplitude = grainAmp;
-                slope = (0.f - amplitude) / (float)releaseSamples;
-                nextBoundaryVal = releaseSamples;
-            }
-            else
-            {
-                finished = true;
-            }
-        }
-    }
-};
-
-//==============================================================================
-// Templated Envelope Rendering Functions following the paper's pseudocode.
-// Each function synthesizes a block (vector) of samples with no per-sample branch checks,
-// then calls checkBoundary() once after the block. If the entire block is safe,
-// the inner loop is fully unrolled.
-//==============================================================================
-
-template <bool Punchy>
-inline int vectorSynthesizeParabolicTemplated(struct Grain &grain,
-    float* outL, float* outR, int blockSize, int bufferLength)
-{
-    auto &st = grain.parabState;
-    if (st.atEnd() || !grain.active)
-    {
-        grain.active = false;
-        return 0;
-    }
-    int processed = 0;
-    int remaining = blockSize;
-    // If the entire block is safe (no boundary), unroll the inner loop without branch.
-    if (st.nextBoundary(remaining) == remaining)
-    {
-        for (int i = 0; i < remaining; ++i)
-        {
-            float env = st.synthesize();
-            float x = (st.totalSamples > 1 ? (float)st.samplesDone / st.totalSamples : 0.f);
-            float effPos = x * (float)grain.sourceReadLength + grain.essence.startOffsetInSamples;
-            float sampleL = 0.f, sampleR = 0.f;
-            int idx0 = (int)effPos;
-            if (effPos >= 0.f && idx0 < bufferLength)
-            {
-                int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
-                float frac = effPos - (float)idx0;
-                sampleL = grain.sourceL[idx0] + frac * (grain.sourceL[idx1] - grain.sourceL[idx0]);
-                sampleR = grain.sourceR[idx0] + frac * (grain.sourceR[idx1] - grain.sourceR[idx0]);
-            }
-            outL[processed + i] += sampleL * (env * (0.5f * (1.0f - grain.essence.panning)));
-            outR[processed + i] += sampleR * (env * (0.5f * (1.0f + grain.essence.panning)));
-        }
-        processed += remaining;
-        st.checkBoundary(remaining);
-    }
-    else
-    {
-        while (remaining > 0 && !st.atEnd())
-        {
-            int boundary = st.nextBoundary(remaining);
-            for (int i = 0; i < boundary; ++i)
-            {
-                float env = st.synthesize();
-                float x = (st.totalSamples > 1 ? (float)st.samplesDone / st.totalSamples : 0.f);
-                float effPos = x * (float)grain.sourceReadLength + grain.essence.startOffsetInSamples;
-                float sampleL = 0.f, sampleR = 0.f;
-                int idx0 = (int)effPos;
-                if (effPos >= 0.f && idx0 < bufferLength)
-                {
-                    int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
-                    float frac = effPos - (float)idx0;
-                    sampleL = grain.sourceL[idx0] + frac * (grain.sourceL[idx1] - grain.sourceL[idx0]);
-                    sampleR = grain.sourceR[idx0] + frac * (grain.sourceR[idx1] - grain.sourceR[idx0]);
-                }
-                outL[processed + i] += sampleL * (env * (0.5f * (1.0f - grain.essence.panning)));
-                outR[processed + i] += sampleR * (env * (0.5f * (1.0f + grain.essence.panning)));
-            }
-            processed += boundary;
-            remaining -= boundary;
-            st.checkBoundary(boundary);
-        }
-    }
-    if (st.atEnd())
-        grain.active = false;
-    return processed;
-}
-
-template <bool Punchy>
-inline int vectorSynthesizeTriangleTemplated(struct Grain &grain,
-    float* outL, float* outR, int blockSize, int bufferLength)
-{
-    auto &st = grain.linearState;
-    if (st.atEnd() || !grain.active)
-    {
-        grain.active = false;
-        return 0;
-    }
-    int processed = 0;
-    int remaining = blockSize;
-    if (st.nextBoundary(remaining) == remaining)
-    {
-        for (int i = 0; i < remaining; ++i)
-        {
-            float env = st.synthesize();
-            float x = (st.totalSamples > 1 ? (float)st.samplesDone / st.totalSamples : 0.f);
-            float effPos = x * (float)grain.sourceReadLength + grain.essence.startOffsetInSamples;
-            float sampleL = 0.f, sampleR = 0.f;
-            int idx0 = (int)effPos;
-            if (effPos >= 0.f && idx0 < bufferLength)
-            {
-                int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
-                float frac = effPos - (float)idx0;
-                sampleL = grain.sourceL[idx0] + frac * (grain.sourceL[idx1] - grain.sourceL[idx0]);
-                sampleR = grain.sourceR[idx0] + frac * (grain.sourceR[idx1] - grain.sourceR[idx0]);
-            }
-            outL[processed + i] += sampleL * (env * (0.5f * (1.0f - grain.essence.panning)));
-            outR[processed + i] += sampleR * (env * (0.5f * (1.0f + grain.essence.panning)));
-        }
-        processed += remaining;
-        st.checkBoundary(remaining);
-    }
-    else
-    {
-        while (remaining > 0 && !st.atEnd())
-        {
-            int boundary = st.nextBoundary(remaining);
-            for (int i = 0; i < boundary; ++i)
-            {
-                float env = st.synthesize();
-                float x = (st.totalSamples > 1 ? (float)st.samplesDone / st.totalSamples : 0.f);
-                float effPos = x * (float)grain.sourceReadLength + grain.essence.startOffsetInSamples;
-                float sampleL = 0.f, sampleR = 0.f;
-                int idx0 = (int)effPos;
-                if (effPos >= 0.f && idx0 < bufferLength)
-                {
-                    int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
-                    float frac = effPos - (float)idx0;
-                    sampleL = grain.sourceL[idx0] + frac * (grain.sourceL[idx1] - grain.sourceL[idx0]);
-                    sampleR = grain.sourceR[idx0] + frac * (grain.sourceR[idx1] - grain.sourceR[idx0]);
-                }
-                outL[processed + i] += sampleL * (env * (0.5f * (1.0f - grain.essence.panning)));
-                outR[processed + i] += sampleR * (env * (0.5f * (1.0f + grain.essence.panning)));
-            }
-            processed += boundary;
-            remaining -= boundary;
-            st.checkBoundary(boundary);
-        }
-    }
-    if (st.atEnd())
-        grain.active = false;
-    return processed;
-}
-
-template <bool Punchy>
-inline int vectorSynthesizeASRTemplated(struct Grain &grain,
-    float* outL, float* outR, int blockSize, int bufferLength)
-{
-    auto &st = grain.asrState;
-    if (st.atEnd() || !grain.active)
-    {
-        grain.active = false;
-        return 0;
-    }
-    int processed = 0;
-    int remaining = blockSize;
-    if (st.nextBoundary(remaining) == remaining)
-    {
-        for (int i = 0; i < remaining; ++i)
-        {
-            float env = st.synthesize();
-            float x = (st.totalSamples > 1 ? (float)st.samplesDone / st.totalSamples : 0.f);
-            float effPos = x * (float)grain.sourceReadLength + grain.essence.startOffsetInSamples;
-            float sampleL = 0.f, sampleR = 0.f;
-            int idx0 = (int)effPos;
-            if (effPos >= 0.f && idx0 < bufferLength)
-            {
-                int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
-                float frac = effPos - (float)idx0;
-                sampleL = grain.sourceL[idx0] + frac * (grain.sourceL[idx1] - grain.sourceL[idx0]);
-                sampleR = grain.sourceR[idx0] + frac * (grain.sourceR[idx1] - grain.sourceR[idx0]);
-            }
-            outL[processed + i] += sampleL * (env * (0.5f * (1.0f - grain.essence.panning)));
-            outR[processed + i] += sampleR * (env * (0.5f * (1.0f + grain.essence.panning)));
-        }
-        processed += remaining;
-        st.checkBoundary(remaining);
-    }
-    else
-    {
-        while (remaining > 0 && !st.atEnd())
-        {
-            int boundary = st.nextBoundary(remaining);
-            for (int i = 0; i < boundary; ++i)
-            {
-                float env = st.synthesize();
-                float x = (st.totalSamples > 1 ? (float)st.samplesDone / st.totalSamples : 0.f);
-                float effPos = x * (float)grain.sourceReadLength + grain.essence.startOffsetInSamples;
-                float sampleL = 0.f, sampleR = 0.f;
-                int idx0 = (int)effPos;
-                if (effPos >= 0.f && idx0 < bufferLength)
-                {
-                    int idx1 = (idx0 + 1 < bufferLength ? idx0 + 1 : bufferLength - 1);
-                    float frac = effPos - (float)idx0;
-                    sampleL = grain.sourceL[idx0] + frac * (grain.sourceL[idx1] - grain.sourceL[idx0]);
-                    sampleR = grain.sourceR[idx0] + frac * (grain.sourceR[idx1] - grain.sourceR[idx0]);
-                }
-                outL[processed + i] += sampleL * (env * (0.5f * (1.0f - grain.essence.panning)));
-                outR[processed + i] += sampleR * (env * (0.5f * (1.0f + grain.essence.panning)));
-            }
-            processed += boundary;
-            remaining -= boundary;
-            st.checkBoundary(boundary);
-        }
-    }
-    if (st.atEnd())
-        grain.active = false;
-    return processed;
-}
-
-//==============================================================================
-// Non-templated wrappers for runtime dispatch
-//==============================================================================
-static int vectorSynthesizeParabolic(struct Grain &grain,
-    float* outL, float* outR, int blockSize, int bufferLength)
-{
-    return vectorSynthesizeParabolicTemplated<false>(grain, outL, outR, blockSize, bufferLength);
-}
-
-static int vectorSynthesizePunchyParabolic(struct Grain &grain,
-    float* outL, float* outR, int blockSize, int bufferLength)
-{
-    return vectorSynthesizeParabolicTemplated<true>(grain, outL, outR, blockSize, bufferLength);
-}
-
-static int vectorSynthesizeTriangle(struct Grain &grain,
-    float* outL, float* outR, int blockSize, int bufferLength)
-{
-    return vectorSynthesizeTriangleTemplated<false>(grain, outL, outR, blockSize, bufferLength);
-}
-
-static int vectorSynthesizePunchyTriangle(struct Grain &grain,
-    float* outL, float* outR, int blockSize, int bufferLength)
-{
-    return vectorSynthesizeTriangleTemplated<true>(grain, outL, outR, blockSize, bufferLength);
-}
-
-static int vectorSynthesizeASR(struct Grain &grain,
-    float* outL, float* outR, int blockSize, int bufferLength)
-{
-    return vectorSynthesizeASRTemplated<false>(grain, outL, outR, blockSize, bufferLength);
-}
-
-static int vectorSynthesizePunchyASR(struct Grain &grain,
-    float* outL, float* outR, int blockSize, int bufferLength)
-{
-    return vectorSynthesizeASRTemplated<true>(grain, outL, outR, blockSize, bufferLength);
-}
-
-//==============================================================================
-// Grain structure with placement-new based activation.
-// A default constructor is provided for fixed-pool construction.
-//==============================================================================
-struct Grain
-{
-    const float* sourceL = nullptr;
-    const float* sourceR = nullptr;
-    double position = 0.0;    // samples processed so far
-    double duration = 0.0;    // total length in samples
-    double delta = 0.0;       // pitch read increment
-    double sourceReadLength = 0.0;
-    bool active = false;
-    float grainAmplitude = 1.0f;
-    GrainEssence essence;
-    EnvelopeMode envelopeMode = EnvelopeMode::Parabolic;
-    using EnvelopeFunction = int(*)(Grain&, float*, float*, int, int);
-    EnvelopeFunction envelopeRenderFn = nullptr;
-    ParabolicEnvelopeState  parabState;
-    LinearEnvelopeState     linearState;
-    ASREnvelopeState        asrState;
-
-    // Default constructor (required for fixed pool construction)
-    Grain() noexcept
-        : sourceL(nullptr), sourceR(nullptr), position(0.0), duration(0.0),
-          delta(0.0), sourceReadLength(0.0), active(false), grainAmplitude(1.0f),
-          essence(), envelopeMode(EnvelopeMode::Parabolic), envelopeRenderFn(nullptr),
-          parabState(), linearState(), asrState()
-    {}
-
-    // In-place activation constructor (used via placement-new)
-    Grain(double dur, double d, const std::array<const float*, 2>& src,
-          float amp, const GrainEssence &e, int bufferLength, EnvelopeFunction fn)
-    {
-        duration = dur;
-        delta = d;
-        double centsFact = std::pow(2.0, e.pitchOffsetCents / 1200.0);
-        sourceReadLength = (d * centsFact) * dur;
-        duration *= e.sizeMult;
-        sourceReadLength *= e.sizeMult;
-        position = 0.0;
-        sourceL = src[0];
-        sourceR = src[1];
-        grainAmplitude = amp * e.volumeMult;
-        active = true;
-        essence = e;
-        envelopeRenderFn = fn;
-        int durSamples = (int)std::lround(duration);
-        if (durSamples < 1)
-            durSamples = 1;
-        if (fn == &vectorSynthesizeParabolic)
-            parabState.initNormal(grainAmplitude, durSamples);
-        else if (fn == &vectorSynthesizePunchyParabolic)
-            parabState.initPunchy(grainAmplitude, durSamples);
-        else if (fn == &vectorSynthesizeTriangle)
-            linearState.initNormal(grainAmplitude, durSamples);
-        else if (fn == &vectorSynthesizePunchyTriangle)
-            linearState.initPunchy(grainAmplitude, durSamples);
-        else if (fn == &vectorSynthesizeASR)
-            asrState.initNormal(grainAmplitude, durSamples);
-        else
-            asrState.initPunchy(grainAmplitude, durSamples);
-    }
-
-    // Synthesis call.
-    int vectorSynthesize(float* outL, float* outR, int blockSize, int bufferLength)
-    {
-        if (!active)
+            grain.active = false;
             return 0;
-        return envelopeRenderFn(*this, outL, outR, blockSize, bufferLength);
-    }
-
-    bool isActive() const { return active; }
-};
-
-//==============================================================================
-// Scheduling Functions using placement-new on fixed pools.
-//==============================================================================
-struct Granular_Synth_2_Helper
-{
-    static void scheduleGrainNormal(
-        bool& /*unusedFirstGrainFlag*/,
-        std::array<Grain, 1>& /*punchyGrainPool*/,
-        std::array<Grain, 11>& normalGrainPool,
-        double grainDuration,
-        double baseDelta,
-        const std::array<const float*, 2>& sample,
-        float grainAmp,
-        const GrainEssence& essence,
-        int bufferLen,
-        int /*unusedAtt*/,
-        int /*unusedRel*/,
-        Grain::EnvelopeFunction normalEnvelopeFn,
-        Grain::EnvelopeFunction /*punchyEnvelopeFn*/)
-    {
-        for (auto &g : normalGrainPool)
-        {
-            if (!g.isActive())
-            {
-                new (&g) Grain(grainDuration, baseDelta, sample, grainAmp, essence, bufferLen, normalEnvelopeFn);
-                break;
-            }
         }
-    }
+        int processed = 0;
+        int remaining = blockSize;
+        const float srl = static_cast<float>(grain.sourceReadLength);
+        const float startOff = grain.essence.startOffsetInSamples;
+        const float pan = grain.essence.panning;
+        const float leftGain = 0.5f * (1.0f - pan);
+        const float rightGain = 0.5f * (1.0f + pan);
+        const float* srcL = grain.sourceL;
+        const float* srcR = grain.sourceR;
+        bool contiguous = ((startOff + srl) < bufferLength);
 
-    static void scheduleGrainPunchy(
-        bool& firstGrainScheduled,
-        std::array<Grain, 1>& punchyGrainPool,
-        std::array<Grain, 11>& normalGrainPool,
-        double grainDuration,
-        double baseDelta,
-        const std::array<const float*, 2>& sample,
-        float grainAmp,
-        const GrainEssence& essence,
-        int bufferLen,
-        int /*unusedAtt*/,
-        int /*unusedRel*/,
-        Grain::EnvelopeFunction normalEnvelopeFn,
-        Grain::EnvelopeFunction punchyEnvelopeFn)
-    {
-        if (!firstGrainScheduled)
+        // If the entire block is safe (no envelope segment boundary)
+        if (st.nextBoundary(remaining) == remaining)
         {
-            for (auto &g : punchyGrainPool)
+            for (int i = 0; i < remaining; ++i)
             {
-                if (!g.isActive())
+                float env = st.synthesize();
+                float x = (st.totalSamples > 0 ? static_cast<float>(st.samplesDone) / st.totalSamples : 0.f);
+                float effPos = x * srl + startOff;
+                float sampleL, sampleR;
+                // For non-negative effPos, casting to int is equivalent to floor.
+                if (contiguous)
                 {
-                    new (&g) Grain(grainDuration, baseDelta, sample, grainAmp, essence, bufferLen, punchyEnvelopeFn);
-                    firstGrainScheduled = true;
-                    break;
+                    int idx0 = static_cast<int>(effPos);
+                    float frac = effPos - static_cast<float>(idx0);
+                    sampleL = srcL[idx0] + frac * (srcL[idx0 + 1] - srcL[idx0]);
+                    sampleR = srcR[idx0] + frac * (srcR[idx0 + 1] - srcR[idx0]);
                 }
+                else
+                {
+                    int idx0 = static_cast<int>(effPos);
+                    float frac = effPos - static_cast<float>(idx0);
+                    int wrappedIdx0 = idx0 & (bufferLength - 1);
+                    int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
+                    sampleL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
+                    sampleR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
+                }
+                outL[processed + i] += sampleL * (env * leftGain);
+                outR[processed + i] += sampleR * (env * rightGain);
             }
+            processed += remaining;
+            st.checkBoundary(remaining);
         }
         else
         {
-            for (auto &g : normalGrainPool)
+            while (remaining > 0 && !st.atEnd())
+            {
+                int boundary = st.nextBoundary(remaining);
+                for (int i = 0; i < boundary; ++i)
+                {
+                    float env = st.synthesize();
+                    float x = (st.totalSamples > 0 ? static_cast<float>(st.samplesDone) / st.totalSamples : 0.f);
+                    float effPos = x * srl + startOff;
+                    float sampleL, sampleR;
+                    if (contiguous)
+                    {
+                        int idx0 = static_cast<int>(effPos);
+                        float frac = effPos - static_cast<float>(idx0);
+                        sampleL = srcL[idx0] + frac * (srcL[idx0 + 1] - srcL[idx0]);
+                        sampleR = srcR[idx0] + frac * (srcR[idx0 + 1] - srcR[idx0]);
+                    }
+                    else
+                    {
+                        int idx0 = static_cast<int>(effPos);
+                        float frac = effPos - static_cast<float>(idx0);
+                        int wrappedIdx0 = idx0 & (bufferLength - 1);
+                        int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
+                        sampleL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
+                        sampleR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
+                    }
+                    outL[processed + i] += sampleL * (env * leftGain);
+                    outR[processed + i] += sampleR * (env * rightGain);
+                }
+                processed += boundary;
+                remaining -= boundary;
+                st.checkBoundary(boundary);
+            }
+        }
+        if (st.atEnd())
+            grain.active = false;
+        return processed;
+    }
+
+    template <bool Punchy>
+    inline int vectorSynthesizeTriangleTemplated(struct Grain& grain,
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        auto& st = grain.linearState;
+        if (st.atEnd() || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+        int processed = 0;
+        int remaining = blockSize;
+        const float srl = static_cast<float>(grain.sourceReadLength);
+        const float startOff = grain.essence.startOffsetInSamples;
+        const float pan = grain.essence.panning;
+        const float leftGain = 0.5f * (1.0f - pan);
+        const float rightGain = 0.5f * (1.0f + pan);
+        const float* srcL = grain.sourceL;
+        const float* srcR = grain.sourceR;
+        bool contiguous = ((startOff + srl) < bufferLength);
+
+        if (st.nextBoundary(remaining) == remaining)
+        {
+            for (int i = 0; i < remaining; ++i)
+            {
+                float env = st.synthesize();
+                float x = (st.totalSamples > 0 ? static_cast<float>(st.samplesDone) / st.totalSamples : 0.f);
+                float effPos = x * srl + startOff;
+                float sampleL, sampleR;
+                if (contiguous)
+                {
+                    int idx0 = static_cast<int>(effPos);
+                    float frac = effPos - static_cast<float>(idx0);
+                    sampleL = srcL[idx0] + frac * (srcL[idx0 + 1] - srcL[idx0]);
+                    sampleR = srcR[idx0] + frac * (srcR[idx0 + 1] - srcR[idx0]);
+                }
+                else
+                {
+                    int idx0 = static_cast<int>(effPos);
+                    float frac = effPos - static_cast<float>(idx0);
+                    int wrappedIdx0 = idx0 & (bufferLength - 1);
+                    int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
+                    sampleL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
+                    sampleR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
+                }
+                outL[processed + i] += sampleL * (env * leftGain);
+                outR[processed + i] += sampleR * (env * rightGain);
+            }
+            processed += remaining;
+            st.checkBoundary(remaining);
+        }
+        else
+        {
+            while (remaining > 0 && !st.atEnd())
+            {
+                int boundary = st.nextBoundary(remaining);
+                for (int i = 0; i < boundary; ++i)
+                {
+                    float env = st.synthesize();
+                    float x = (st.totalSamples > 0 ? static_cast<float>(st.samplesDone) / st.totalSamples : 0.f);
+                    float effPos = x * srl + startOff;
+                    float sampleL, sampleR;
+                    if (contiguous)
+                    {
+                        int idx0 = static_cast<int>(effPos);
+                        float frac = effPos - static_cast<float>(idx0);
+                        sampleL = srcL[idx0] + frac * (srcL[idx0 + 1] - srcL[idx0]);
+                        sampleR = srcR[idx0] + frac * (srcR[idx0 + 1] - srcR[idx0]);
+                    }
+                    else
+                    {
+                        int idx0 = static_cast<int>(effPos);
+                        float frac = effPos - static_cast<float>(idx0);
+                        int wrappedIdx0 = idx0 & (bufferLength - 1);
+                        int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
+                        sampleL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
+                        sampleR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
+                    }
+                    outL[processed + i] += sampleL * (env * leftGain);
+                    outR[processed + i] += sampleR * (env * rightGain);
+                }
+                processed += boundary;
+                remaining -= boundary;
+                st.checkBoundary(boundary);
+            }
+        }
+        if (st.atEnd())
+            grain.active = false;
+        return processed;
+    }
+
+    template <bool Punchy>
+    inline int vectorSynthesizeASRTemplated(struct Grain& grain,
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        auto& st = grain.asrState;
+        if (st.atEnd() || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+        int processed = 0;
+        int remaining = blockSize;
+        const float srl = static_cast<float>(grain.sourceReadLength);
+        const float startOff = grain.essence.startOffsetInSamples;
+        const float pan = grain.essence.panning;
+        const float leftGain = 0.5f * (1.0f - pan);
+        const float rightGain = 0.5f * (1.0f + pan);
+        const float* srcL = grain.sourceL;
+        const float* srcR = grain.sourceR;
+        bool contiguous = ((startOff + srl) < bufferLength);
+
+        if (st.nextBoundary(remaining) == remaining)
+        {
+            for (int i = 0; i < remaining; ++i)
+            {
+                float env = st.synthesize();
+                float x = (st.totalSamples > 0 ? static_cast<float>(st.samplesDone) / st.totalSamples : 0.f);
+                float effPos = x * srl + startOff;
+                float sampleL, sampleR;
+                if (contiguous)
+                {
+                    int idx0 = static_cast<int>(effPos);
+                    float frac = effPos - static_cast<float>(idx0);
+                    sampleL = srcL[idx0] + frac * (srcL[idx0 + 1] - srcL[idx0]);
+                    sampleR = srcR[idx0] + frac * (srcR[idx0 + 1] - srcR[idx0]);
+                }
+                else
+                {
+                    int idx0 = static_cast<int>(effPos);
+                    float frac = effPos - static_cast<float>(idx0);
+                    int wrappedIdx0 = idx0 & (bufferLength - 1);
+                    int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
+                    sampleL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
+                    sampleR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
+                }
+                outL[processed + i] += sampleL * (env * leftGain);
+                outR[processed + i] += sampleR * (env * rightGain);
+            }
+            processed += remaining;
+            st.checkBoundary(remaining);
+        }
+        else
+        {
+            while (remaining > 0 && !st.atEnd())
+            {
+                int boundary = st.nextBoundary(remaining);
+                for (int i = 0; i < boundary; ++i)
+                {
+                    float env = st.synthesize();
+                    float x = (st.totalSamples > 0 ? static_cast<float>(st.samplesDone) / st.totalSamples : 0.f);
+                    float effPos = x * srl + startOff;
+                    float sampleL, sampleR;
+                    if (contiguous)
+                    {
+                        int idx0 = static_cast<int>(effPos);
+                        float frac = effPos - static_cast<float>(idx0);
+                        sampleL = srcL[idx0] + frac * (srcL[idx0 + 1] - srcL[idx0]);
+                        sampleR = srcR[idx0] + frac * (srcR[idx0 + 1] - srcR[idx0]);
+                    }
+                    else
+                    {
+                        int idx0 = static_cast<int>(effPos);
+                        float frac = effPos - static_cast<float>(idx0);
+                        int wrappedIdx0 = idx0 & (bufferLength - 1);
+                        int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
+                        sampleL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
+                        sampleR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
+                    }
+                    outL[processed + i] += sampleL * (env * leftGain);
+                    outR[processed + i] += sampleR * (env * rightGain);
+                }
+                processed += boundary;
+                remaining -= boundary;
+                st.checkBoundary(boundary);
+            }
+        }
+        if (st.atEnd())
+            grain.active = false;
+        return processed;
+    }
+
+    //==============================================================================
+    // Non-templated wrappers for runtime dispatch
+    //==============================================================================
+    static int vectorSynthesizeParabolic(struct Grain& grain,
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        return vectorSynthesizeParabolicTemplated<false>(grain, outL, outR, blockSize, bufferLength);
+    }
+
+    static int vectorSynthesizePunchyParabolic(struct Grain& grain,
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        return vectorSynthesizeParabolicTemplated<true>(grain, outL, outR, blockSize, bufferLength);
+    }
+
+    static int vectorSynthesizeTriangle(struct Grain& grain,
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        return vectorSynthesizeTriangleTemplated<false>(grain, outL, outR, blockSize, bufferLength);
+    }
+
+    static int vectorSynthesizePunchyTriangle(struct Grain& grain,
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        return vectorSynthesizeTriangleTemplated<true>(grain, outL, outR, blockSize, bufferLength);
+    }
+
+    static int vectorSynthesizeASR(struct Grain& grain,
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        return vectorSynthesizeASRTemplated<false>(grain, outL, outR, blockSize, bufferLength);
+    }
+
+    static int vectorSynthesizePunchyASR(struct Grain& grain,
+        float* outL, float* outR, int blockSize, int bufferLength)
+    {
+        return vectorSynthesizeASRTemplated<true>(grain, outL, outR, blockSize, bufferLength);
+    }
+
+    //==============================================================================
+    // Grain structure with placement-new based activation.
+    // A default constructor is provided for fixed-pool construction.
+    //==============================================================================
+    struct Grain
+    {
+        const float* sourceL = nullptr;
+        const float* sourceR = nullptr;
+        double position = 0.0;    // samples processed so far
+        double duration = 0.0;    // total length in samples
+        double delta = 0.0;       // pitch read increment
+        double sourceReadLength = 0.0;
+        bool active = false;
+        float grainAmplitude = 1.0f;
+        GrainEssence essence;
+        EnvelopeMode envelopeMode = EnvelopeMode::Parabolic;
+        using EnvelopeFunction = int(*)(Grain&, float*, float*, int, int);
+        EnvelopeFunction envelopeRenderFn = nullptr;
+        ParabolicEnvelopeState  parabState;
+        LinearEnvelopeState     linearState;
+        ASREnvelopeState        asrState;
+
+        // Default constructor (required for fixed pool construction)
+        Grain() noexcept
+            : sourceL(nullptr), sourceR(nullptr), position(0.0), duration(0.0),
+            delta(0.0), sourceReadLength(0.0), active(false), grainAmplitude(1.0f),
+            essence(), envelopeMode(EnvelopeMode::Parabolic), envelopeRenderFn(nullptr),
+            parabState(), linearState(), asrState()
+        {
+        }
+
+        // In-place activation constructor (used via placement-new)
+        Grain(double dur, double d, const std::array<const float*, 2>& src,
+            float amp, const GrainEssence& e, int bufferLength, EnvelopeFunction fn)
+        {
+            duration = dur;
+            delta = d;
+            double centsFact = std::pow(2.0, e.pitchOffsetCents / 1200.0);
+            sourceReadLength = (d * centsFact) * dur;
+            duration *= e.sizeMult;
+            sourceReadLength *= e.sizeMult;
+            position = 0.0;
+            sourceL = src[0];
+            sourceR = src[1];
+            grainAmplitude = amp * e.volumeMult;
+            active = true;
+            essence = e;
+            envelopeRenderFn = fn;
+            int durSamples = static_cast<int>(std::lround(duration));
+            if (durSamples < 1)
+                durSamples = 1;
+            if (fn == &vectorSynthesizeParabolic)
+                parabState.initNormal(grainAmplitude, durSamples);
+            else if (fn == &vectorSynthesizePunchyParabolic)
+                parabState.initPunchy(grainAmplitude, durSamples);
+            else if (fn == &vectorSynthesizeTriangle)
+                linearState.initNormal(grainAmplitude, durSamples);
+            else if (fn == &vectorSynthesizePunchyTriangle)
+                linearState.initPunchy(grainAmplitude, durSamples);
+            else if (fn == &vectorSynthesizeASR)
+                asrState.initNormal(grainAmplitude, durSamples);
+            else
+                asrState.initPunchy(grainAmplitude, durSamples);
+        }
+
+        // Synthesis call.
+        int vectorSynthesize(float* outL, float* outR, int blockSize, int bufferLength)
+        {
+            if (!active)
+                return 0;
+            return envelopeRenderFn(*this, outL, outR, blockSize, bufferLength);
+        }
+
+        bool isActive() const { return active; }
+    };
+
+    //==============================================================================
+    // Scheduling Functions using placement-new on fixed pools.
+    //==============================================================================
+    struct Granular_Synth_2_Helper
+    {
+        static void scheduleGrainNormal(
+            bool& /*unusedFirstGrainFlag*/,
+            std::array<Grain, 1>& /*punchyGrainPool*/,
+            std::array<Grain, 11>& normalGrainPool,
+            double grainDuration,
+            double baseDelta,
+            const std::array<const float*, 2>& sample,
+            float grainAmp,
+            const GrainEssence& essence,
+            int bufferLen,
+            int /*unusedAtt*/,
+            int /*unusedRel*/,
+            Grain::EnvelopeFunction normalEnvelopeFn,
+            Grain::EnvelopeFunction /*punchyEnvelopeFn*/)
+        {
+            for (auto& g : normalGrainPool)
             {
                 if (!g.isActive())
                 {
@@ -814,577 +870,606 @@ struct Granular_Synth_2_Helper
                 }
             }
         }
-    }
-};
 
-using ScheduleGrainFunction = void(*)(bool&,
-    std::array<Grain, 1>&,
-    std::array<Grain, 11>&,
-    double, double,
-    const std::array<const float*, 2>&,
-    float,
-    const GrainEssence&,
-    int,
-    int,
-    int,
-    Grain::EnvelopeFunction,
-    Grain::EnvelopeFunction);
-
-//==============================================================================
-// Granular_Synth Class Template (SNEX node – unchanged)
-//==============================================================================
-template <int NV>
-struct Granular_Synth : public data::base
-{
-    SNEX_NODE(Granular_Synth);
-    struct MetadataClass { SN_NODE_ID("Granular_Synth"); };
-
-    static constexpr bool isModNode() { return false; }
-    static constexpr bool isPolyphonic() { return NV > 1; }
-    static constexpr bool hasTail() { return true; }
-    static constexpr bool isSuspendedOnSilence() { return false; }
-    static constexpr int getFixChannelAmount() { return 2; }
-
-    static constexpr int NumTables = 0;
-    static constexpr int NumSliderPacks = 0;
-    static constexpr int NumAudioFiles = 1;
-    static constexpr int NumFilters = 0;
-    static constexpr int NumDisplayBuffers = 0;
-
-    struct Voice
-    {
-        int midiNote = 60;
-        bool isActive = false;
-        float velocity = 1.0f;
-        std::array<Grain, 1> punchyGrainPool;
-        std::array<Grain, 11> normalGrainPool;
-        int grainSchedulerCounter = 0;
-        double grainSchedulerInterval = 0.0;
-        double modPhase = 0.0;
-        bool firstGrainScheduled = false;
-        double scanDirection = 1.0;
-
-        void reset(int note, float vel, int /*grainSizeSamples*/, int grainIntervalSamples)
+        static void scheduleGrainPunchy(
+            bool& firstGrainScheduled,
+            std::array<Grain, 1>& punchyGrainPool,
+            std::array<Grain, 11>& normalGrainPool,
+            double grainDuration,
+            double baseDelta,
+            const std::array<const float*, 2>& sample,
+            float grainAmp,
+            const GrainEssence& essence,
+            int bufferLen,
+            int /*unusedAtt*/,
+            int /*unusedRel*/,
+            Grain::EnvelopeFunction normalEnvelopeFn,
+            Grain::EnvelopeFunction punchyEnvelopeFn)
         {
-            midiNote = note;
-            velocity = vel;
-            isActive = true;
-            firstGrainScheduled = false;
-            for (auto &gr : punchyGrainPool)
-                gr.active = false;
-            for (auto &gr : normalGrainPool)
-                gr.active = false;
-            grainSchedulerCounter = 0;
-            grainSchedulerInterval = (double)grainIntervalSamples;
-            modPhase = 0.0;
-            scanDirection = 1.0;
+            if (!firstGrainScheduled)
+            {
+                for (auto& g : punchyGrainPool)
+                {
+                    if (!g.isActive())
+                    {
+                        new (&g) Grain(grainDuration, baseDelta, sample, grainAmp, essence, bufferLen, punchyEnvelopeFn);
+                        firstGrainScheduled = true;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                for (auto& g : normalGrainPool)
+                {
+                    if (!g.isActive())
+                    {
+                        new (&g) Grain(grainDuration, baseDelta, sample, grainAmp, essence, bufferLen, normalEnvelopeFn);
+                        break;
+                    }
+                }
+            }
         }
     };
 
-    PolyData<Voice, NV> voices;
-    ExternalData sampleData;
-    AudioBuffer<float> sampleBuffer;
-    std::array<const float*, 2> sample{ nullptr, nullptr };
-    std::array<float, 128> pitchRatios{};
-    double sampleRate = 44100.0;
-    double sampleRateRatio = 1.0;
-    int grainSizeInSamples = 0;
-    int grainIntervalInSamples = 0;
-    double globalPitchOffsetFactor = 1.0;
-    float grainStartPercent = 0.0f;
-    float grainStartOffsetInSamples = 0.0f;
-    double grainPitchOffsetSemitones = 0.0;
-    ModValue gate;
-    std::mt19937 randomGen;
-    double grainOffsetCentsRange = 10.0;
-    float grainVolumeMin = 0.8f;
-    float grainPanRange = 0.25f;
-    double grainGapAdjustmentMaxSec = 0.25;
-    float grainSizeRandom = 0.0f;
-    double grainSizeMS = 1000.0;
-    double grainIntervalMS = 1500.0;
-    float grainSpray = 0.0f;
-    float grainSprayMode = 0.0f;
-    bool startModEnabled = false;
-    double startModTimeSec = 0.0;
-    int raisedCosAttackSamples = 0;
-    int raisedCosReleaseSamples = 0;
-    bool punchyMode = false;
-    int envelopeType = 0;
-    typename Grain::EnvelopeFunction normalEnvelopeFn = &vectorSynthesizeParabolic;
-    typename Grain::EnvelopeFunction punchyEnvelopeFn = &vectorSynthesizePunchyParabolic;
-    ScheduleGrainFunction scheduleGrainFn = nullptr;
-    std::vector<float> tempBlockOutL;
-    std::vector<float> tempBlockOutR;
+    using ScheduleGrainFunction = void(*)(bool&,
+        std::array<Grain, 1>&,
+        std::array<Grain, 11>&,
+        double, double,
+        const std::array<const float*, 2>&,
+        float,
+        const GrainEssence&,
+        int,
+        int,
+        int,
+        Grain::EnvelopeFunction,
+        Grain::EnvelopeFunction);
 
-    inline static float reflectOffset(float offset, float bufferLen)
+    //==============================================================================
+    // Granular_Synth Class Template (SNEX node – unchanged)
+    //==============================================================================
+    template <int NV>
+    struct Granular_Synth : public data::base
     {
-        const float doubleLen = 2.0f * bufferLen;
-        if (offset > -doubleLen && offset < doubleLen)
+        SNEX_NODE(Granular_Synth);
+        struct MetadataClass { SN_NODE_ID("Granular_Synth"); };
+
+        static constexpr bool isModNode() { return false; }
+        static constexpr bool isPolyphonic() { return NV > 1; }
+        static constexpr bool hasTail() { return true; }
+        static constexpr bool isSuspendedOnSilence() { return false; }
+        static constexpr int getFixChannelAmount() { return 2; }
+
+        static constexpr int NumTables = 0;
+        static constexpr int NumSliderPacks = 0;
+        static constexpr int NumAudioFiles = 1;
+        static constexpr int NumFilters = 0;
+        static constexpr int NumDisplayBuffers = 0;
+
+        struct Voice
         {
-            if (offset < 0.0f)
-                offset += doubleLen;
-        }
-        else
-        {
-            offset = std::fmod(offset, doubleLen);
-            if (offset < 0.0f)
-                offset += doubleLen;
-        }
-        if (offset > bufferLen)
-            offset = doubleLen - offset;
-        return offset;
-    }
+            int midiNote = 60;
+            bool isActive = false;
+            float velocity = 1.0f;
+            std::array<Grain, 1> punchyGrainPool;
+            std::array<Grain, 11> normalGrainPool;
+            int grainSchedulerCounter = 0;
+            double grainSchedulerInterval = 0.0;
+            double modPhase = 0.0;
+            bool firstGrainScheduled = false;
+            double scanDirection = 1.0;
 
-    void prepare(PrepareSpecs specs)
-    {
-        sampleRate = specs.sampleRate;
-        initPitchRatios();
-        updateDerivedParameters();
-        voices.prepare(specs);
-        std::random_device rd;
-        randomGen.seed(rd());
-        if (punchyMode)
-            scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainPunchy;
-        else
-            scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainNormal;
-        updateEnvelopeFunctions();
-    }
-
-    void updateDerivedParameters()
-    {
-        grainSizeInSamples = (int)std::lround((grainSizeMS / 1000.0) * sampleRate);
-        grainIntervalInSamples = (int)std::lround((grainIntervalMS / 1000.0) * sampleRate);
-        sampleRateRatio = (sampleData.sampleRate > 0 ? sampleData.sampleRate : 44100.0) / sampleRate;
-        globalPitchOffsetFactor = std::pow(2.0, grainPitchOffsetSemitones / 12.0);
-        int currentSampleLength = sampleBuffer.getNumSamples();
-        if (currentSampleLength < 1)
-            currentSampleLength = 1;
-        grainStartOffsetInSamples = grainStartPercent * (float)(currentSampleLength - 1);
-        raisedCosAttackSamples = (int)std::lround(0.02 * sampleRate);
-        raisedCosReleaseSamples = (int)std::lround(0.02 * sampleRate);
-    }
-
-    void updateEnvelopeFunctions()
-    {
-        if (envelopeType == 0)
-        {
-            normalEnvelopeFn = &vectorSynthesizeParabolic;
-            punchyEnvelopeFn = &vectorSynthesizePunchyParabolic;
-        }
-        else if (envelopeType == 1)
-        {
-            normalEnvelopeFn = &vectorSynthesizeTriangle;
-            punchyEnvelopeFn = &vectorSynthesizePunchyTriangle;
-        }
-        else // ASR
-        {
-            normalEnvelopeFn = &vectorSynthesizeASR;
-            punchyEnvelopeFn = &vectorSynthesizePunchyASR;
-        }
-    }
-
-    void reset()
-    {
-        for (auto &voice : voices)
-            voice.isActive = false;
-    }
-
-    void setExternalData(const ExternalData &ed, int /*index*/)
-    {
-        sampleData = ed;
-        AudioSampleBuffer tempBuffer = ed.toAudioSampleBuffer();
-        int numSamples = tempBuffer.getNumSamples();
-        int numChannels = tempBuffer.getNumChannels();
-        if (numSamples <= 0)
-        {
-            static AudioBuffer<float> safetyBuffer(2, 4);
-            safetyBuffer.clear();
-            sampleBuffer.makeCopyOf(safetyBuffer, true);
-        }
-        else
-        {
-            sampleBuffer.makeCopyOf(tempBuffer, true);
-        }
-        sample[0] = sampleBuffer.getReadPointer(0);
-        if (numChannels > 1)
-            sample[1] = sampleBuffer.getReadPointer(1);
-        else
-            sample[1] = sample[0];
-        updateDerivedParameters();
-    }
-
-    void handleHiseEvent(HiseEvent &e)
-    {
-        if (e.isNoteOn())
-        {
-            auto &voice = voices.get();
-            voice.reset(e.getNoteNumber(), e.getFloatVelocity(), grainSizeInSamples, grainIntervalInSamples);
-        }
-    }
-
-    // Process function using vectorized synthesis and scheduler integration.
-    // This version processes blocks of samples (vectorized) exactly as in the paper's pseudocode.
-    template <typename ProcessDataType>
-    void process(ProcessDataType &data)
-    {
-        DataReadLock sl(this->sampleData);
-        auto &fixData = data.template as<ProcessData<getFixChannelAmount()>>();
-        auto audioBlock = fixData.toAudioBlock();
-        auto* leftChannel = audioBlock.getChannelPointer(0);
-        auto* rightChannel = audioBlock.getChannelPointer(1);
-        int totalSamples = data.getNumSamples();
-
-        if (sampleBuffer.getNumSamples() == 0)
-        {
-            audioBlock.clear();
-            return;
-        }
-
-        std::fill(leftChannel, leftChannel + totalSamples, 0.0f);
-        std::fill(rightChannel, rightChannel + totalSamples, 0.0f);
-
-        if (tempBlockOutL.size() < (size_t)totalSamples)
-        {
-            tempBlockOutL.resize(totalSamples, 0.f);
-            tempBlockOutR.resize(totalSamples, 0.f);
-        }
-
-        const int sampleLen = sampleBuffer.getNumSamples();
-        int globalOffset = 0;
-
-        // Process the output block in vectorized segments.
-        // The scheduler is updated at sample-accurate boundaries as computed by the envelopes.
-        while (globalOffset < totalSamples)
-        {
-            int nextEvent = totalSamples - globalOffset;
-            for (auto &voice : voices)
+            void reset(int note, float vel, int /*grainSizeSamples*/, int grainIntervalSamples)
             {
-                if (!voice.isActive)
-                    continue;
-                nextEvent = std::min(nextEvent, voice.grainSchedulerCounter);
-                for (auto &grain : voice.normalGrainPool)
-                {
-                    if (grain.isActive())
-                    {
-                        int rem = (int)(grain.duration - grain.position);
-                        nextEvent = std::min(nextEvent, rem);
-                    }
-                }
-                for (auto &grain : voice.punchyGrainPool)
-                {
-                    if (grain.isActive())
-                    {
-                        int rem = (int)(grain.duration - grain.position);
-                        nextEvent = std::min(nextEvent, rem);
-                    }
-                }
+                midiNote = note;
+                velocity = vel;
+                isActive = true;
+                firstGrainScheduled = false;
+                for (auto& gr : punchyGrainPool)
+                    gr.active = false;
+                for (auto& gr : normalGrainPool)
+                    gr.active = false;
+                grainSchedulerCounter = 0;
+                grainSchedulerInterval = static_cast<double>(grainIntervalSamples);
+                modPhase = 0.0;
+                scanDirection = 1.0;
             }
-            if (nextEvent < 1)
-                nextEvent = 1;
+        };
 
-            std::fill(tempBlockOutL.begin(), tempBlockOutL.begin() + nextEvent, 0.f);
-            std::fill(tempBlockOutR.begin(), tempBlockOutR.begin() + nextEvent, 0.f);
+        PolyData<Voice, NV> voices;
+        ExternalData sampleData;
+        AudioBuffer<float> sampleBuffer;
+        std::array<const float*, 2> sample{ nullptr, nullptr };
+        std::array<float, 128> pitchRatios{};
+        double sampleRate = 44100.0;
+        double sampleRateRatio = 1.0;
+        int grainSizeInSamples = 0;
+        int grainIntervalInSamples = 0;
+        double globalPitchOffsetFactor = 1.0;
+        float grainStartPercent = 0.0f;
+        float grainStartOffsetInSamples = 0.0f;
+        double grainPitchOffsetSemitones = 0.0;
+        ModValue gate;
+        std::mt19937 randomGen;
+        double grainOffsetCentsRange = 10.0;
+        float grainVolumeMin = 0.8f;
+        float grainPanRange = 0.25f;
+        double grainGapAdjustmentMaxSec = 0.25;
+        float grainSizeRandom = 0.0f;
+        double grainSizeMS = 1000.0;
+        double grainIntervalMS = 1500.0;
+        float grainSpray = 0.0f;
+        float grainSprayMode = 0.0f;
+        bool startModEnabled = false;
+        double startModTimeSec = 0.0;
+        int raisedCosAttackSamples = 0;
+        int raisedCosReleaseSamples = 0;
+        bool punchyMode = false;
+        int envelopeType = 0;
+        typename Grain::EnvelopeFunction normalEnvelopeFn = &vectorSynthesizeParabolic;
+        typename Grain::EnvelopeFunction punchyEnvelopeFn = &vectorSynthesizePunchyParabolic;
+        ScheduleGrainFunction scheduleGrainFn = nullptr;
+        std::vector<float> tempBlockOutL;
+        std::vector<float> tempBlockOutR;
 
-            // Synthesize all active grains for this segment.
-            for (auto &voice : voices)
+        // New safer external data function:
+        // In setExternalData(), enforce that the sample buffer is a power-of-two length.
+        // If the incoming buffer is empty, use a fallback buffer with 8 samples of silence.
+        void setExternalData(const ExternalData& ed, int /*index*/)
+        {
+            sampleData = ed;
+            AudioSampleBuffer tempBuffer = ed.toAudioSampleBuffer();
+            int numSamples = tempBuffer.getNumSamples();
+            int numChannels = tempBuffer.getNumChannels();
+
+            if (numSamples <= 0)
             {
-                if (!voice.isActive)
-                    continue;
-                for (auto &grain : voice.punchyGrainPool)
-                {
-                    if (grain.isActive())
-                    {
-                        int n = grain.vectorSynthesize(tempBlockOutL.data(), tempBlockOutR.data(), nextEvent, sampleLen);
-                        grain.position += n;
-                    }
-                }
-                for (auto &grain : voice.normalGrainPool)
-                {
-                    if (grain.isActive())
-                    {
-                        int n = grain.vectorSynthesize(tempBlockOutL.data(), tempBlockOutR.data(), nextEvent, sampleLen);
-                        grain.position += n;
-                    }
-                }
+                numSamples = 8;
+                int channelsToUse = (numChannels > 0) ? numChannels : 2;
+                AudioSampleBuffer fallbackBuffer(channelsToUse, numSamples);
+                fallbackBuffer.clear();
+                sampleBuffer.makeCopyOf(fallbackBuffer, true);
+            }
+            else if (!isPowerOfTwo(numSamples))
+            {
+                int newSize = nextPowerOfTwo(numSamples);
+                AudioSampleBuffer newBuffer(numChannels, newSize);
+                newBuffer.clear();
+                for (int ch = 0; ch < numChannels; ++ch)
+                    newBuffer.copyFrom(ch, 0, tempBuffer, ch, 0, numSamples);
+                sampleBuffer.makeCopyOf(newBuffer, true);
+            }
+            else
+            {
+                sampleBuffer.makeCopyOf(tempBuffer, true);
             }
 
-            // Mix synthesized segment into the output block.
-            for (int i = 0; i < nextEvent; ++i)
-            {
-                leftChannel[globalOffset + i] += tempBlockOutL[i];
-                rightChannel[globalOffset + i] += tempBlockOutR[i];
-            }
+            sample[0] = sampleBuffer.getReadPointer(0);
+            if (numChannels > 1)
+                sample[1] = sampleBuffer.getReadPointer(1);
+            else
+                sample[1] = sample[0];
 
-            // Update scheduler and activate new grains if needed (at the exact sample boundaries as computed by the envelopes).
-            for (auto &voice : voices)
-            {
-                if (!voice.isActive)
-                    continue;
-                voice.grainSchedulerCounter -= nextEvent;
-                while (voice.grainSchedulerCounter <= 0)
-                {
-                    double baseDelta = pitchRatios[voice.midiNote] * sampleRateRatio * globalPitchOffsetFactor;
-                    double grainDuration = (double)grainSizeInSamples;
-                    GrainEssence essence;
-                    {
-                        std::uniform_real_distribution<double> pitchOffDist(-grainOffsetCentsRange, grainOffsetCentsRange);
-                        essence.pitchOffsetCents = pitchOffDist(randomGen);
-                        std::uniform_real_distribution<float> volDist(grainVolumeMin, 1.0f);
-                        essence.volumeMult = volDist(randomGen);
-                        std::uniform_real_distribution<float> panDist(-grainPanRange, grainPanRange);
-                        essence.panning = panDist(randomGen);
-                        std::uniform_int_distribution<int> gapDist(0, (int)std::lround(grainGapAdjustmentMaxSec * sampleRate));
-                        essence.gapAdjustment = gapDist(randomGen);
-                        std::uniform_real_distribution<float> sizeDist(1.0f - grainSizeRandom, 1.0f);
-                        essence.sizeMult = sizeDist(randomGen);
-                        float finalStartOffset = grainStartOffsetInSamples;
-                        if (startModEnabled && startModTimeSec > 0.00001)
-                        {
-                            int samplesPassed = grainIntervalInSamples + essence.gapAdjustment;
-                            double timeSec = (double)samplesPassed / sampleRate;
-                            double cycleTime = startModTimeSec;
-                            double increment = timeSec / cycleTime;
-                            voice.modPhase += increment * voice.scanDirection;
-                            if (voice.modPhase >= 1.0)
-                            {
-                                voice.modPhase = 2.0 - voice.modPhase;
-                                voice.scanDirection = -1.0;
-                            }
-                            else if (voice.modPhase <= 0.0)
-                            {
-                                voice.modPhase = -voice.modPhase;
-                                voice.scanDirection = 1.0;
-                            }
-                            float curPercent = (float)voice.modPhase;
-                            finalStartOffset = curPercent * (float)(sampleLen - 1);
-                        }
-                        if (grainSpray > 0.0f)
-                        {
-                            std::uniform_real_distribution<float> sprayDist(0.0f, 1.0f);
-                            float rnd = sprayDist(randomGen);
-                            float left = -grainSprayMode * grainSpray * (float)sampleLen;
-                            float range = grainSpray * (1.0f + grainSprayMode) * (float)sampleLen;
-                            float offset = left + rnd * range;
-                            finalStartOffset += offset;
-                        }
-                        if (grainSprayMode >= 0.5f)
-                        {
-                            finalStartOffset = reflectOffset(finalStartOffset, (float)sampleLen);
-                        }
-                        else
-                        {
-                            if (finalStartOffset < 0.f)
-                                finalStartOffset = 0.f;
-                        }
-                        essence.startOffsetInSamples = finalStartOffset;
-                    }
-                    float grainAmp = voice.velocity;
-                    scheduleGrainFn(
-                        voice.firstGrainScheduled,
-                        voice.punchyGrainPool,
-                        voice.normalGrainPool,
-                        grainDuration,
-                        baseDelta,
-                        sample,
-                        grainAmp,
-                        essence,
-                        sampleLen,
-                        raisedCosAttackSamples,
-                        raisedCosReleaseSamples,
-                        normalEnvelopeFn,
-                        punchyEnvelopeFn
-                    );
-                    voice.grainSchedulerCounter += (grainIntervalInSamples + essence.gapAdjustment);
-                }
-            }
-            globalOffset += nextEvent;
-        }
-    }
-
-    template <typename FrameDataType>
-    void processFrame(FrameDataType &/*data*/)
-    {
-        // Not used.
-    }
-
-    template <int P>
-    void setParameter(double v)
-    {
-        if constexpr (P == 0)
-        {
-            grainPitchOffsetSemitones = v;
             updateDerivedParameters();
         }
-        else if constexpr (P == 1)
+
+        void updateDerivedParameters()
         {
-            grainOffsetCentsRange = v;
+            grainSizeInSamples = static_cast<int>(std::lround((grainSizeMS / 1000.0) * sampleRate));
+            grainIntervalInSamples = static_cast<int>(std::lround((grainIntervalMS / 1000.0) * sampleRate));
+            sampleRateRatio = (sampleData.sampleRate > 0 ? sampleData.sampleRate : 44100.0) / sampleRate;
+            globalPitchOffsetFactor = std::pow(2.0, grainPitchOffsetSemitones / 12.0);
+            int currentSampleLength = sampleBuffer.getNumSamples();
+            if (currentSampleLength < 1)
+                currentSampleLength = 1;
+            grainStartOffsetInSamples = grainStartPercent * static_cast<float>(currentSampleLength - 1);
+            raisedCosAttackSamples = static_cast<int>(std::lround(0.02 * sampleRate));
+            raisedCosReleaseSamples = static_cast<int>(std::lround(0.02 * sampleRate));
         }
-        else if constexpr (P == 2)
+
+        void updateEnvelopeFunctions()
         {
-            grainVolumeMin = 1.0f - (float)v;
-        }
-        else if constexpr (P == 3)
-        {
-            grainPanRange = (float)v;
-        }
-        else if constexpr (P == 4)
-        {
-            grainGapAdjustmentMaxSec = v;
-        }
-        else if constexpr (P == 5)
-        {
-            grainSizeMS = v;
-            updateDerivedParameters();
-        }
-        else if constexpr (P == 6)
-        {
-            grainIntervalMS = v;
-            updateDerivedParameters();
-        }
-        else if constexpr (P == 7)
-        {
-            grainSizeRandom = (float)v;
-        }
-        else if constexpr (P == 8)
-        {
-            grainStartPercent = (float)v;
-            updateDerivedParameters();
-        }
-        else if constexpr (P == 9)
-        {
-            startModTimeSec = v;
-        }
-        else if constexpr (P == 10)
-        {
-            startModEnabled = (v >= 0.5);
-        }
-        else if constexpr (P == 11)
-        {
-            grainSpray = (float)v;
-        }
-        else if constexpr (P == 12)
-        {
-            grainSprayMode = (v >= 0.5f) ? 1.0f : 0.0f;
-        }
-        else if constexpr (P == 13)
-        {
-            bool oldPunchyMode = punchyMode;
-            punchyMode = (v >= 0.5);
-            if (oldPunchyMode != punchyMode)
+            if (envelopeType == 0)
             {
-                if (punchyMode)
-                    scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainPunchy;
-                else
-                    scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainNormal;
+                normalEnvelopeFn = &vectorSynthesizeParabolic;
+                punchyEnvelopeFn = &vectorSynthesizePunchyParabolic;
+            }
+            else if (envelopeType == 1)
+            {
+                normalEnvelopeFn = &vectorSynthesizeTriangle;
+                punchyEnvelopeFn = &vectorSynthesizePunchyTriangle;
+            }
+            else // ASR
+            {
+                normalEnvelopeFn = &vectorSynthesizeASR;
+                punchyEnvelopeFn = &vectorSynthesizePunchyASR;
             }
         }
-        else if constexpr (P == 14)
+
+        void reset()
         {
-            envelopeType = (int)std::round(v * 2.0f);
+            for (auto& voice : voices)
+                voice.isActive = false;
+        }
+
+        void prepare(PrepareSpecs specs)
+        {
+            sampleRate = specs.sampleRate;
+            initPitchRatios();
+            updateDerivedParameters();
+            voices.prepare(specs);
+            std::random_device rd;
+            randomGen.seed(rd());
+            if (punchyMode)
+                scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainPunchy;
+            else
+                scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainNormal;
             updateEnvelopeFunctions();
         }
-    }
 
-    void createParameters(ParameterDataList &data)
-    {
+        void handleHiseEvent(HiseEvent& e)
         {
-            parameter::data pitchOffsetParam("Pitch (semitones)", { -24.0, 24.0, 0.01 });
-            registerCallback<0>(pitchOffsetParam);
-            pitchOffsetParam.setDefaultValue(0.0);
-            data.add(std::move(pitchOffsetParam));
+            if (e.isNoteOn())
+            {
+                auto& voice = voices.get();
+                voice.reset(e.getNoteNumber(), e.getFloatVelocity(), grainSizeInSamples, grainIntervalInSamples);
+            }
         }
-        {
-            parameter::data offsetParam("Rand Pitch Detune", { 0.0, 100.0, 0.1 });
-            registerCallback<1>(offsetParam);
-            offsetParam.setDefaultValue(0.0);
-            data.add(std::move(offsetParam));
-        }
-        {
-            parameter::data volMinParam("Rand Vol", { 0.0, 0.8, 0.01 });
-            registerCallback<2>(volMinParam);
-            volMinParam.setDefaultValue(0.0);
-            data.add(std::move(volMinParam));
-        }
-        {
-            parameter::data panParam("Rand Pan", { 0.0, 1.0, 0.01 });
-            registerCallback<3>(panParam);
-            panParam.setDefaultValue(0.0);
-            data.add(std::move(panParam));
-        }
-        {
-            parameter::data gapParam("Rand Interval (sec)", { 0.0, 1.0, 0.01 });
-            registerCallback<4>(gapParam);
-            gapParam.setDefaultValue(0.0);
-            data.add(std::move(gapParam));
-        }
-        {
-            parameter::data sizeParam("Grain Size (ms)", { 10.0, 2000.0, 1.0 });
-            registerCallback<5>(sizeParam);
-            sizeParam.setDefaultValue(1000.0);
-            data.add(std::move(sizeParam));
-        }
-        {
-            parameter::data intervalParam("Grain Interval (ms)", { 10.0, 3000.0, 1.0 });
-            registerCallback<6>(intervalParam);
-            intervalParam.setDefaultValue(1500.0);
-            data.add(std::move(intervalParam));
-        }
-        {
-            parameter::data sizeRandomParam("Rand Size", { 0.0, 0.8, 0.01 });
-            registerCallback<7>(sizeRandomParam);
-            sizeRandomParam.setDefaultValue(0.0);
-            data.add(std::move(sizeRandomParam));
-        }
-        {
-            parameter::data startParam("Playhead Position", { 0.0, 1.0, 0.001 });
-            registerCallback<8>(startParam);
-            startParam.setDefaultValue(0.0);
-            data.add(std::move(startParam));
-        }
-        {
-            parameter::data startModTime("Scan Time (sec)", { 0.0, 20.0, 0.001 });
-            registerCallback<9>(startModTime);
-            startModTime.setDefaultValue(0.0);
-            data.add(std::move(startModTime));
-        }
-        {
-            parameter::data startModEnable("Scan Enable", { 0.0, 1.0, 1.0 });
-            registerCallback<10>(startModEnable);
-            startModEnable.setDefaultValue(0.0);
-            data.add(std::move(startModEnable));
-        }
-        {
-            parameter::data sprayParam("Spray", { 0.0, 1.0, 0.01 });
-            registerCallback<11>(sprayParam);
-            sprayParam.setDefaultValue(0.0);
-            data.add(std::move(sprayParam));
-        }
-        {
-            parameter::data sprayModeParam("Spray Mode", { 0.0, 1.0, 1.0 });
-            registerCallback<12>(sprayModeParam);
-            sprayModeParam.setDefaultValue(0.0);
-            data.add(std::move(sprayModeParam));
-        }
-        {
-            parameter::data punchyParam("Punchy Mode", { 0.0, 1.0, 1.0 });
-            registerCallback<13>(punchyParam);
-            punchyParam.setDefaultValue(0.0);
-            data.add(std::move(punchyParam));
-        }
-        {
-            parameter::data envTypeParam("Envelope Type", { 0.0, 1.0, 0.5f });
-            registerCallback<14>(envTypeParam);
-            envTypeParam.setDefaultValue(0.0);
-            data.add(std::move(envTypeParam));
-        }
-    }
 
-    void initPitchRatios()
-    {
-        for (int i = 0; i < 128; ++i)
-            pitchRatios[i] = std::pow(2.0f, (float)(i - 60) / 12.0f);
-    }
-};
+        // Process function using vectorized synthesis and scheduler integration.
+        template <typename ProcessDataType>
+        void process(ProcessDataType& data)
+        {
+            DataReadLock sl(this->sampleData);
+            auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
+            auto audioBlock = fixData.toAudioBlock();
+            auto* leftChannel = audioBlock.getChannelPointer(0);
+            auto* rightChannel = audioBlock.getChannelPointer(1);
+            int totalSamples = data.getNumSamples();
+
+            if (sampleBuffer.getNumSamples() == 0)
+            {
+                audioBlock.clear();
+                return;
+            }
+            std::fill(leftChannel, leftChannel + totalSamples, 0.0f);
+            std::fill(rightChannel, rightChannel + totalSamples, 0.0f);
+
+            if (tempBlockOutL.size() < static_cast<size_t>(totalSamples))
+            {
+                tempBlockOutL.resize(totalSamples, 0.f);
+                tempBlockOutR.resize(totalSamples, 0.f);
+            }
+
+            const int sampleLen = sampleBuffer.getNumSamples();
+            int globalOffset = 0;
+            while (globalOffset < totalSamples)
+            {
+                int nextEvent = totalSamples - globalOffset;
+                for (auto& voice : voices)
+                {
+                    if (!voice.isActive)
+                        continue;
+                    nextEvent = std::min(nextEvent, voice.grainSchedulerCounter);
+                    for (auto& grain : voice.normalGrainPool)
+                    {
+                        if (grain.isActive())
+                        {
+                            int rem = static_cast<int>(grain.duration - grain.position);
+                            nextEvent = std::min(nextEvent, rem);
+                        }
+                    }
+                    for (auto& grain : voice.punchyGrainPool)
+                    {
+                        if (grain.isActive())
+                        {
+                            int rem = static_cast<int>(grain.duration - grain.position);
+                            nextEvent = std::min(nextEvent, rem);
+                        }
+                    }
+                }
+                if (nextEvent < 1)
+                    nextEvent = 1;
+                std::fill(tempBlockOutL.begin(), tempBlockOutL.begin() + nextEvent, 0.f);
+                std::fill(tempBlockOutR.begin(), tempBlockOutR.begin() + nextEvent, 0.f);
+
+                for (auto& voice : voices)
+                {
+                    if (!voice.isActive)
+                        continue;
+                    for (auto& grain : voice.punchyGrainPool)
+                    {
+                        if (grain.isActive())
+                        {
+                            int n = grain.vectorSynthesize(tempBlockOutL.data(), tempBlockOutR.data(), nextEvent, sampleLen);
+                            grain.position += n;
+                        }
+                    }
+                    for (auto& grain : voice.normalGrainPool)
+                    {
+                        if (grain.isActive())
+                        {
+                            int n = grain.vectorSynthesize(tempBlockOutL.data(), tempBlockOutR.data(), nextEvent, sampleLen);
+                            grain.position += n;
+                        }
+                    }
+                }
+                for (int i = 0; i < nextEvent; ++i)
+                {
+                    leftChannel[globalOffset + i] += tempBlockOutL[i];
+                    rightChannel[globalOffset + i] += tempBlockOutR[i];
+                }
+                for (auto& voice : voices)
+                {
+                    if (!voice.isActive)
+                        continue;
+                    voice.grainSchedulerCounter -= nextEvent;
+                    while (voice.grainSchedulerCounter <= 0)
+                    {
+                        double baseDelta = pitchRatios[voice.midiNote] * sampleRateRatio * globalPitchOffsetFactor;
+                        double grainDuration = static_cast<double>(grainSizeInSamples);
+                        GrainEssence essence;
+                        {
+                            std::uniform_real_distribution<double> pitchOffDist(-grainOffsetCentsRange, grainOffsetCentsRange);
+                            essence.pitchOffsetCents = pitchOffDist(randomGen);
+                            std::uniform_real_distribution<float> volDist(grainVolumeMin, 1.0f);
+                            essence.volumeMult = volDist(randomGen);
+                            std::uniform_real_distribution<float> panDist(-grainPanRange, grainPanRange);
+                            essence.panning = panDist(randomGen);
+                            std::uniform_int_distribution<int> gapDist(0, static_cast<int>(std::lround(grainGapAdjustmentMaxSec * sampleRate)));
+                            essence.gapAdjustment = gapDist(randomGen);
+                            std::uniform_real_distribution<float> sizeDist(1.0f - grainSizeRandom, 1.0f);
+                            essence.sizeMult = sizeDist(randomGen);
+                            float finalStartOffset = grainStartOffsetInSamples;
+                            if (startModEnabled && startModTimeSec > 0.00001)
+                            {
+                                int samplesPassed = grainIntervalInSamples + essence.gapAdjustment;
+                                double timeSec = static_cast<double>(samplesPassed) / sampleRate;
+                                double cycleTime = startModTimeSec;
+                                double increment = timeSec / cycleTime;
+                                voice.modPhase += increment * voice.scanDirection;
+                                if (voice.modPhase >= 1.0)
+                                {
+                                    voice.modPhase = 2.0 - voice.modPhase;
+                                    voice.scanDirection = -1.0;
+                                }
+                                else if (voice.modPhase <= 0.0)
+                                {
+                                    voice.modPhase = -voice.modPhase;
+                                    voice.scanDirection = 1.0;
+                                }
+                                float curPercent = static_cast<float>(voice.modPhase);
+                                finalStartOffset = curPercent * (static_cast<float>(sampleLen) - 1);
+                            }
+                            if (grainSpray > 0.0f)
+                            {
+                                std::uniform_real_distribution<float> sprayDist(0.0f, 1.0f);
+                                float rnd = sprayDist(randomGen);
+                                float left = -grainSprayMode * grainSpray * static_cast<float>(sampleLen);
+                                float range = grainSpray * (1.0f + grainSprayMode) * static_cast<float>(sampleLen);
+                                float offset = left + rnd * range;
+                                finalStartOffset += offset;
+                            }
+                            if (grainSprayMode >= 0.5f)
+                            {
+                                int idx = static_cast<int>(finalStartOffset);
+                                float frac = finalStartOffset - static_cast<float>(idx);
+                                int wrappedIdx = idx & (sampleLen - 1);
+                                finalStartOffset = static_cast<float>(wrappedIdx) + frac;
+                            }
+                            else
+                            {
+                                if (finalStartOffset < 0.f)
+                                    finalStartOffset = 0.f;
+                            }
+                            essence.startOffsetInSamples = finalStartOffset;
+                        }
+                        float grainAmp = voice.velocity;
+                        scheduleGrainFn(
+                            voice.firstGrainScheduled,
+                            voice.punchyGrainPool,
+                            voice.normalGrainPool,
+                            grainDuration,
+                            baseDelta,
+                            sample,
+                            grainAmp,
+                            essence,
+                            sampleLen,
+                            raisedCosAttackSamples,
+                            raisedCosReleaseSamples,
+                            normalEnvelopeFn,
+                            punchyEnvelopeFn
+                        );
+                        voice.grainSchedulerCounter += (grainIntervalInSamples + essence.gapAdjustment);
+                    }
+                }
+                globalOffset += nextEvent;
+            }
+        }
+
+        template <typename FrameDataType>
+        void processFrame(FrameDataType& /*data*/)
+        {
+            // Not used.
+        }
+
+        template <int P>
+        void setParameter(double v)
+        {
+            if constexpr (P == 0)
+            {
+                grainPitchOffsetSemitones = v;
+                updateDerivedParameters();
+            }
+            else if constexpr (P == 1)
+            {
+                grainOffsetCentsRange = v;
+            }
+            else if constexpr (P == 2)
+            {
+                grainVolumeMin = 1.0f - static_cast<float>(v);
+            }
+            else if constexpr (P == 3)
+            {
+                grainPanRange = static_cast<float>(v);
+            }
+            else if constexpr (P == 4)
+            {
+                grainGapAdjustmentMaxSec = v;
+            }
+            else if constexpr (P == 5)
+            {
+                grainSizeMS = v;
+                updateDerivedParameters();
+            }
+            else if constexpr (P == 6)
+            {
+                grainIntervalMS = v;
+                updateDerivedParameters();
+            }
+            else if constexpr (P == 7)
+            {
+                grainSizeRandom = static_cast<float>(v);
+            }
+            else if constexpr (P == 8)
+            {
+                grainStartPercent = static_cast<float>(v);
+                updateDerivedParameters();
+            }
+            else if constexpr (P == 9)
+            {
+                startModTimeSec = v;
+            }
+            else if constexpr (P == 10)
+            {
+                startModEnabled = (v >= 0.5);
+            }
+            else if constexpr (P == 11)
+            {
+                grainSpray = static_cast<float>(v);
+            }
+            else if constexpr (P == 12)
+            {
+                grainSprayMode = (v >= 0.5f) ? 1.0f : 0.0f;
+            }
+            else if constexpr (P == 13)
+            {
+                bool oldPunchyMode = punchyMode;
+                punchyMode = (v >= 0.5);
+                if (oldPunchyMode != punchyMode)
+                {
+                    if (punchyMode)
+                        scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainPunchy;
+                    else
+                        scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainNormal;
+                }
+            }
+            else if constexpr (P == 14)
+            {
+                envelopeType = static_cast<int>(std::round(v * 2.0f));
+                updateEnvelopeFunctions();
+            }
+        }
+
+        void createParameters(ParameterDataList& data)
+        {
+            {
+                parameter::data pitchOffsetParam("Pitch (semitones)", { -24.0, 24.0, 0.01 });
+                registerCallback<0>(pitchOffsetParam);
+                pitchOffsetParam.setDefaultValue(0.0);
+                data.add(std::move(pitchOffsetParam));
+            }
+            {
+                parameter::data offsetParam("Rand Pitch Detune", { 0.0, 100.0, 0.1 });
+                registerCallback<1>(offsetParam);
+                offsetParam.setDefaultValue(0.0);
+                data.add(std::move(offsetParam));
+            }
+            {
+                parameter::data volMinParam("Rand Vol", { 0.0, 0.8, 0.01 });
+                registerCallback<2>(volMinParam);
+                volMinParam.setDefaultValue(0.0);
+                data.add(std::move(volMinParam));
+            }
+            {
+                parameter::data panParam("Rand Pan", { 0.0, 1.0, 0.01 });
+                registerCallback<3>(panParam);
+                panParam.setDefaultValue(0.0);
+                data.add(std::move(panParam));
+            }
+            {
+                parameter::data gapParam("Rand Interval (sec)", { 0.0, 1.0, 0.01 });
+                registerCallback<4>(gapParam);
+                gapParam.setDefaultValue(0.0);
+                data.add(std::move(gapParam));
+            }
+            {
+                parameter::data sizeParam("Grain Size (ms)", { 10.0, 2000.0, 1.0 });
+                registerCallback<5>(sizeParam);
+                sizeParam.setDefaultValue(1000.0);
+                data.add(std::move(sizeParam));
+            }
+            {
+                parameter::data intervalParam("Grain Interval (ms)", { 10.0, 3000.0, 1.0 });
+                registerCallback<6>(intervalParam);
+                intervalParam.setDefaultValue(1500.0);
+                data.add(std::move(intervalParam));
+            }
+            {
+                parameter::data sizeRandomParam("Rand Size", { 0.0, 0.8, 0.01 });
+                registerCallback<7>(sizeRandomParam);
+                sizeRandomParam.setDefaultValue(0.0);
+                data.add(std::move(sizeRandomParam));
+            }
+            {
+                parameter::data startParam("Playhead Position", { 0.0, 1.0, 0.001 });
+                registerCallback<8>(startParam);
+                startParam.setDefaultValue(0.0);
+                data.add(std::move(startParam));
+            }
+            {
+                parameter::data startModTime("Scan Time (sec)", { 0.0, 20.0, 0.001 });
+                registerCallback<9>(startModTime);
+                startModTime.setDefaultValue(0.0);
+                data.add(std::move(startModTime));
+            }
+            {
+                parameter::data startModEnable("Scan Enable", { 0.0, 1.0, 1.0 });
+                registerCallback<10>(startModEnable);
+                startModEnable.setDefaultValue(0.0);
+                data.add(std::move(startModEnable));
+            }
+            {
+                parameter::data sprayParam("Spray", { 0.0, 1.0, 0.01 });
+                registerCallback<11>(sprayParam);
+                sprayParam.setDefaultValue(0.0);
+                data.add(std::move(sprayParam));
+            }
+            {
+                parameter::data sprayModeParam("Spray Mode", { 0.0, 1.0, 1.0 });
+                registerCallback<12>(sprayModeParam);
+                sprayModeParam.setDefaultValue(0.0);
+                data.add(std::move(sprayModeParam));
+            }
+            {
+                parameter::data punchyParam("Punchy Mode", { 0.0, 1.0, 1.0 });
+                registerCallback<13>(punchyParam);
+                punchyParam.setDefaultValue(0.0);
+                data.add(std::move(punchyParam));
+            }
+            {
+                parameter::data envTypeParam("Envelope Type", { 0.0, 1.0, 0.5f });
+                registerCallback<14>(envTypeParam);
+                envTypeParam.setDefaultValue(0.0);
+                data.add(std::move(envTypeParam));
+            }
+        }
+
+        void initPitchRatios()
+        {
+            for (int i = 0; i < 128; ++i)
+                pitchRatios[i] = std::pow(2.0f, (float)(i - 60) / 12.0f);
+        }
+    };
 
 } // namespace project
