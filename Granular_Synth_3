@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <random>
 #include <limits>
-#include <new>  // for placement-new
+#include <new>  
+
+#include "src\GranularSIMDHelpers.h"
 
 namespace project
 {
