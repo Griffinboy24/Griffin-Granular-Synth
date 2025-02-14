@@ -95,8 +95,18 @@ namespace project
 
         void initNormal(float gA, int durSamples)
         {
-            finished = false; totalSamples = durSamples; samplesDone = 0; isPunchy = false; segmentIndex = 0;
-            if (durSamples < 1) { amplitude = slope = curve = 0.0f; finished = true; return; }
+            finished = false;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            isPunchy = false;
+            segmentIndex = 0;
+
+            if (durSamples < 1)
+            {
+                amplitude = slope = curve = 0.0f;
+                finished = true;
+                return;
+            }
             amplitude = 0.0f;
             double rdur = 1.0 / double(durSamples);
             double rdur2 = rdur * rdur;
@@ -107,18 +117,37 @@ namespace project
 
         void initPunchy(float gA, int durSamples)
         {
-            finished = false; totalSamples = durSamples; samplesDone = 0; isPunchy = true; segmentIndex = 0; finalAmplitude = gA;
-            if (durSamples < 2) { amplitude = slope = curve = 0.0f; finished = true; return; }
-            int half = durSamples / 2; if (half < 1) half = 1;
-            amplitude = gA; slope = curve = 0.0f; nextBoundaryVal = half;
+            finished = false;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            isPunchy = true;
+            segmentIndex = 0;
+            finalAmplitude = gA;
+
+            if (durSamples < 2)
+            {
+                amplitude = slope = curve = 0.0f;
+                finished = true;
+                return;
+            }
+            int half = durSamples / 2;
+            if (half < 1) half = 1;
+            amplitude = gA;
+            slope = curve = 0.0f;
+            nextBoundaryVal = half;
         }
 
-        int nextBoundary(int maximum) const { return std::min(maximum, nextBoundaryVal); }
+        int nextBoundary(int maximum) const
+        {
+            return std::min(maximum, nextBoundaryVal);
+        }
 
         FORCE_INLINE float synthesize()
         {
             float current = amplitude;
-            amplitude += slope; slope += curve; ++samplesDone;
+            amplitude += slope;
+            slope += curve;
+            ++samplesDone;
             return current;
         }
 
@@ -131,18 +160,29 @@ namespace project
 
         FORCE_INLINE void advanceSegment()
         {
-            if (!isPunchy) { finished = true; return; }
+            if (!isPunchy)
+            {
+                finished = true;
+                return;
+            }
             if (segmentIndex == 0)
             {
                 segmentIndex = 1;
                 int half = totalSamples - (totalSamples / 2);
-                if (half < 1) { finished = true; return; }
+                if (half < 1)
+                {
+                    finished = true;
+                    return;
+                }
                 const float H = static_cast<float>(half);
                 slope = -finalAmplitude / (H * H);
                 curve = -(2.0f * finalAmplitude) / (H * H);
                 nextBoundaryVal = half;
             }
-            else { finished = true; }
+            else
+            {
+                finished = true;
+            }
         }
 
         bool atEnd() const { return finished; }
@@ -165,26 +205,60 @@ namespace project
 
         void initNormal(float gA, int durSamples)
         {
-            finished = false; isPunchy = false; segmentIndex = 0; totalSamples = durSamples; samplesDone = 0; grainAmp = gA;
-            if (durSamples < 2) { amplitude = 0.f; slope = 0.f; finished = true; return; }
-            int half = durSamples / 2; if (half < 1) half = 1;
-            amplitude = 0.f; slope = gA / static_cast<float>(half); nextBoundaryVal = half;
+            finished = false;
+            isPunchy = false;
+            segmentIndex = 0;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            grainAmp = gA;
+
+            if (durSamples < 2)
+            {
+                amplitude = 0.f;
+                slope = 0.f;
+                finished = true;
+                return;
+            }
+            int half = durSamples / 2;
+            if (half < 1) half = 1;
+            amplitude = 0.f;
+            slope = gA / static_cast<float>(half);
+            nextBoundaryVal = half;
         }
 
         void initPunchy(float gA, int durSamples)
         {
-            finished = false; isPunchy = true; segmentIndex = 0; totalSamples = durSamples; samplesDone = 0; grainAmp = gA;
-            if (durSamples < 2) { amplitude = gA; slope = 0.f; finished = true; return; }
-            int half = durSamples / 2; if (half < 1) half = 1;
-            amplitude = gA; slope = 0.f; nextBoundaryVal = half;
+            finished = false;
+            isPunchy = true;
+            segmentIndex = 0;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            grainAmp = gA;
+
+            if (durSamples < 2)
+            {
+                amplitude = gA;
+                slope = 0.f;
+                finished = true;
+                return;
+            }
+            int half = durSamples / 2;
+            if (half < 1) half = 1;
+            amplitude = gA;
+            slope = 0.f;
+            nextBoundaryVal = half;
         }
 
-        int nextBoundary(int maximum) const { return std::min(maximum, nextBoundaryVal); }
+        int nextBoundary(int maximum) const
+        {
+            return std::min(maximum, nextBoundaryVal);
+        }
 
         FORCE_INLINE float synthesize()
         {
             float current = amplitude;
-            amplitude += slope; ++samplesDone;
+            amplitude += slope;
+            ++samplesDone;
             return current;
         }
 
@@ -203,12 +277,19 @@ namespace project
                 {
                     segmentIndex = 1;
                     int half = totalSamples - (totalSamples / 2);
-                    if (half < 1) { finished = true; return; }
+                    if (half < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
                     amplitude = grainAmp;
                     slope = (0.f - grainAmp) / static_cast<float>(half);
                     nextBoundaryVal = half;
                 }
-                else { finished = true; }
+                else
+                {
+                    finished = true;
+                }
             }
             else
             {
@@ -216,11 +297,18 @@ namespace project
                 {
                     segmentIndex = 1;
                     int half = totalSamples - (totalSamples / 2);
-                    if (half < 1) { finished = true; return; }
+                    if (half < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
                     slope = (0.f - amplitude) / static_cast<float>(half);
                     nextBoundaryVal = half;
                 }
-                else { finished = true; }
+                else
+                {
+                    finished = true;
+                }
             }
         }
 
@@ -247,28 +335,62 @@ namespace project
 
         void initNormal(float gA, int durSamples)
         {
-            finished = false; isPunchy = false; segmentIndex = 0; totalSamples = durSamples; samplesDone = 0; grainAmp = gA;
-            if (durSamples < 2) { amplitude = 0.f; slope = 0.f; finished = true; return; }
-            int attackSamples = static_cast<int>(std::round(static_cast<float>(durSamples) * attackRatio / (attackRatio + sustainRatio + releaseRatio)));
+            finished = false;
+            isPunchy = false;
+            segmentIndex = 0;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            grainAmp = gA;
+
+            if (durSamples < 2)
+            {
+                amplitude = 0.f;
+                slope = 0.f;
+                finished = true;
+                return;
+            }
+            int attackSamples = static_cast<int>(std::round(static_cast<float>(durSamples)
+                * attackRatio / (attackRatio + sustainRatio + releaseRatio)));
             if (attackSamples < 1) attackSamples = 1;
-            amplitude = 0.f; slope = gA / static_cast<float>(attackSamples); nextBoundaryVal = attackSamples;
+            amplitude = 0.f;
+            slope = gA / static_cast<float>(attackSamples);
+            nextBoundaryVal = attackSamples;
         }
 
         void initPunchy(float gA, int durSamples)
         {
-            finished = false; isPunchy = true; segmentIndex = 0; totalSamples = durSamples; samplesDone = 0; grainAmp = gA;
-            if (durSamples < 2) { amplitude = gA; slope = 0.f; finished = true; return; }
-            int attackSamples = static_cast<int>(std::round(static_cast<float>(durSamples) * attackRatio / (attackRatio + releaseRatio)));
+            finished = false;
+            isPunchy = true;
+            segmentIndex = 0;
+            totalSamples = durSamples;
+            samplesDone = 0;
+            grainAmp = gA;
+
+            if (durSamples < 2)
+            {
+                amplitude = gA;
+                slope = 0.f;
+                finished = true;
+                return;
+            }
+            int attackSamples = static_cast<int>(std::round(static_cast<float>(durSamples)
+                * attackRatio / (attackRatio + releaseRatio)));
             if (attackSamples < 1) attackSamples = 1;
-            amplitude = gA; slope = 0.f; nextBoundaryVal = attackSamples;
+            amplitude = gA;
+            slope = 0.f;
+            nextBoundaryVal = attackSamples;
         }
 
-        int nextBoundary(int maximum) const { return std::min(maximum, nextBoundaryVal); }
+        int nextBoundary(int maximum) const
+        {
+            return std::min(maximum, nextBoundaryVal);
+        }
 
         FORCE_INLINE float synthesize()
         {
             float current = amplitude;
-            amplitude += slope; ++samplesDone;
+            amplitude += slope;
+            ++samplesDone;
             return current;
         }
 
@@ -286,29 +408,58 @@ namespace project
                 if (segmentIndex == 0)
                 {
                     segmentIndex = 1;
-                    int sustainSamples = static_cast<int>(std::round(static_cast<float>(totalSamples) * sustainRatio / (attackRatio + sustainRatio + releaseRatio)));
-                    if (sustainSamples < 1) { finished = true; return; }
-                    amplitude = grainAmp; slope = 0.f; nextBoundaryVal = sustainSamples;
+                    int sustainSamples = static_cast<int>(std::round(static_cast<float>(totalSamples)
+                        * sustainRatio / (attackRatio + sustainRatio + releaseRatio)));
+                    if (sustainSamples < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
+                    amplitude = grainAmp;
+                    slope = 0.f;
+                    nextBoundaryVal = sustainSamples;
                 }
                 else if (segmentIndex == 1)
                 {
                     segmentIndex = 2;
-                    int releaseSamples = totalSamples - static_cast<int>(std::round(static_cast<float>(totalSamples) * (attackRatio + sustainRatio) / (attackRatio + sustainRatio + releaseRatio)));
-                    if (releaseSamples < 1) { finished = true; return; }
-                    amplitude = grainAmp; slope = (0.f - grainAmp) / static_cast<float>(releaseSamples); nextBoundaryVal = releaseSamples;
+                    int releaseSamples = totalSamples -
+                        static_cast<int>(std::round(static_cast<float>(totalSamples)
+                            * (attackRatio + sustainRatio) / (attackRatio + sustainRatio + releaseRatio)));
+                    if (releaseSamples < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
+                    amplitude = grainAmp;
+                    slope = (0.f - grainAmp) / static_cast<float>(releaseSamples);
+                    nextBoundaryVal = releaseSamples;
                 }
-                else { finished = true; }
+                else
+                {
+                    finished = true;
+                }
             }
             else
             {
                 if (segmentIndex == 0)
                 {
                     segmentIndex = 1;
-                    int releaseSamples = totalSamples - static_cast<int>(std::round(static_cast<float>(totalSamples) * attackRatio / (attackRatio + releaseRatio)));
-                    if (releaseSamples < 1) { finished = true; return; }
-                    amplitude = grainAmp; slope = (0.f - amplitude) / static_cast<float>(releaseSamples); nextBoundaryVal = releaseSamples;
+                    int releaseSamples = totalSamples -
+                        static_cast<int>(std::round(static_cast<float>(totalSamples)
+                            * attackRatio / (attackRatio + releaseRatio)));
+                    if (releaseSamples < 1)
+                    {
+                        finished = true;
+                        return;
+                    }
+                    amplitude = grainAmp;
+                    slope = (0.f - amplitude) / static_cast<float>(releaseSamples);
+                    nextBoundaryVal = releaseSamples;
                 }
-                else { finished = true; }
+                else
+                {
+                    finished = true;
+                }
             }
         }
 
@@ -322,8 +473,162 @@ namespace project
     static constexpr uint32_t FIXED_MASK = FIXED_ONE - 1;
 
     //==============================================================================
-    // Templated Envelope Rendering Functions using fixed-point phase accumulator.
-    // FORCE_INLINE is used to encourage full inlining.
+    // 1) HELPER FUNCTIONS FOR PARABOLIC (CONTIGUOUS / WRAP)
+    //    Flattened boundary logic + no inside loop branching for contiguous vs. wrap
+    //==============================================================================
+    template <bool Punchy>
+    FORCE_INLINE int vectorSynthesizeParabolicContiguous(struct Grain& grain,
+        float* outL, float* outR,
+        int blockSize)
+    {
+        auto& st = grain.parabState;
+        if (st.atEnd() || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+
+        int processed = 0;
+        int remaining = blockSize;
+
+        const float leftGain = 0.5f * (1.0f - grain.essence.panning);
+        const float rightGain = 0.5f * (1.0f + grain.essence.panning);
+        const float* srcL = grain.sourceL;
+        const float* srcR = grain.sourceR;
+
+        while (remaining > 0 && !st.atEnd())
+        {
+            int boundary = st.nextBoundary(remaining);
+
+            if (boundary >= remaining)
+            {
+                // Single big loop for entire block
+                for (int i = 0; i < remaining; ++i)
+                {
+                    float env = st.synthesize();
+                    int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
+                    float frac = (grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+
+                    float sampL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
+                    float sampR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
+
+                    outL[processed + i] += sampL * (env * leftGain);
+                    outR[processed + i] += sampR * (env * rightGain);
+
+                    grain.phaseAcc += grain.phaseInc;
+                }
+                st.checkBoundary(remaining);
+                processed += remaining;
+                remaining = 0;
+            }
+            else
+            {
+                // Partial block up to boundary
+                for (int i = 0; i < boundary; ++i)
+                {
+                    float env = st.synthesize();
+                    int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
+                    float frac = (grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+
+                    float sampL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
+                    float sampR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
+
+                    outL[processed + i] += sampL * (env * leftGain);
+                    outR[processed + i] += sampR * (env * rightGain);
+
+                    grain.phaseAcc += grain.phaseInc;
+                }
+                st.checkBoundary(boundary);
+                processed += boundary;
+                remaining -= boundary;
+            }
+        }
+
+        if (st.atEnd())
+            grain.active = false;
+
+        return processed;
+    }
+
+    template <bool Punchy>
+    FORCE_INLINE int vectorSynthesizeParabolicWrap(struct Grain& grain,
+        float* outL, float* outR,
+        int blockSize, int bufferLength)
+    {
+        auto& st = grain.parabState;
+        if (st.atEnd() || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+
+        int processed = 0;
+        int remaining = blockSize;
+
+        const float leftGain = 0.5f * (1.0f - grain.essence.panning);
+        const float rightGain = 0.5f * (1.0f + grain.essence.panning);
+        const float* srcL = grain.sourceL;
+        const float* srcR = grain.sourceR;
+
+        while (remaining > 0 && !st.atEnd())
+        {
+            int boundary = st.nextBoundary(remaining);
+
+            if (boundary >= remaining)
+            {
+                for (int i = 0; i < remaining; ++i)
+                {
+                    float env = st.synthesize();
+                    int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
+                    float frac = (grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+
+                    int wrappedIdx0 = idx & (bufferLength - 1);
+                    int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
+
+                    float sampL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
+                    float sampR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
+
+                    outL[processed + i] += sampL * (env * leftGain);
+                    outR[processed + i] += sampR * (env * rightGain);
+
+                    grain.phaseAcc += grain.phaseInc;
+                }
+                st.checkBoundary(remaining);
+                processed += remaining;
+                remaining = 0;
+            }
+            else
+            {
+                for (int i = 0; i < boundary; ++i)
+                {
+                    float env = st.synthesize();
+                    int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
+                    float frac = (grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+
+                    int wrappedIdx0 = idx & (bufferLength - 1);
+                    int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
+
+                    float sampL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
+                    float sampR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
+
+                    outL[processed + i] += sampL * (env * leftGain);
+                    outR[processed + i] += sampR * (env * rightGain);
+
+                    grain.phaseAcc += grain.phaseInc;
+                }
+                st.checkBoundary(boundary);
+                processed += boundary;
+                remaining -= boundary;
+            }
+        }
+
+        if (st.atEnd())
+            grain.active = false;
+
+        return processed;
+    }
+
+    // This is the main public templated function for Parabolic
     template <bool Punchy>
     FORCE_INLINE int vectorSynthesizeParabolicTemplated(struct Grain& grain,
         float* outL, float* outR, int blockSize, int bufferLength)
@@ -334,76 +639,27 @@ namespace project
             grain.active = false;
             return 0;
         }
-        int processed = 0, remaining = blockSize;
-        const float leftGain = 0.5f * (1.0f - grain.essence.panning);
-        const float rightGain = 0.5f * (1.0f + grain.essence.panning);
-        const float* srcL = grain.sourceL;
-        const float* srcR = grain.sourceR;
-        bool contiguous = ((grain.essence.startOffsetInSamples + static_cast<float>(grain.sourceReadLength)) < bufferLength);
 
-        if (st.nextBoundary(remaining) == remaining)
-        {
-            for (int i = 0; i < remaining; ++i)
-            {
-                float env = st.synthesize();
-                int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
-                float frac = (grain.phaseAcc & FIXED_MASK) / static_cast<float>(FIXED_ONE);
-                if (contiguous)
-                {
-                    outL[processed + i] += (srcL[idx] + frac * (srcL[idx + 1] - srcL[idx])) * (env * leftGain);
-                    outR[processed + i] += (srcR[idx] + frac * (srcR[idx + 1] - srcR[idx])) * (env * rightGain);
-                }
-                else
-                {
-                    int wrappedIdx0 = idx & (bufferLength - 1);
-                    int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
-                    outL[processed + i] += (srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0])) * (env * leftGain);
-                    outR[processed + i] += (srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0])) * (env * rightGain);
-                }
-                grain.phaseAcc += grain.phaseInc;
-            }
-            processed += remaining;
-            st.checkBoundary(remaining);
-        }
+        // Decide once if contiguous
+        bool contiguous = (
+            (grain.essence.startOffsetInSamples + float(grain.sourceReadLength))
+            < bufferLength
+            );
+
+        if (contiguous)
+            return vectorSynthesizeParabolicContiguous<Punchy>(grain, outL, outR, blockSize);
         else
-        {
-            while (remaining > 0 && !st.atEnd())
-            {
-                int boundary = st.nextBoundary(remaining);
-                for (int i = 0; i < boundary; ++i)
-                {
-                    float env = st.synthesize();
-                    int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
-                    float frac = (grain.phaseAcc & FIXED_MASK) / static_cast<float>(FIXED_ONE);
-                    float sampleL, sampleR;
-                    if (contiguous)
-                    {
-                        sampleL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
-                        sampleR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
-                    }
-                    else
-                    {
-                        int wrappedIdx0 = idx & (bufferLength - 1);
-                        int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
-                        sampleL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
-                        sampleR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
-                    }
-                    outL[processed + i] += sampleL * (env * leftGain);
-                    outR[processed + i] += sampleR * (env * rightGain);
-                    grain.phaseAcc += grain.phaseInc;
-                }
-                processed += boundary;
-                remaining -= boundary;
-                st.checkBoundary(boundary);
-            }
-        }
-        if (st.atEnd()) grain.active = false;
-        return processed;
+            return vectorSynthesizeParabolicWrap<Punchy>(grain, outL, outR, blockSize, bufferLength);
     }
 
+    //==============================================================================
+    // 2) HELPER FUNCTIONS FOR TRIANGLE (CONTIGUOUS / WRAP)
+    //    Same flattened boundary approach
+    //==============================================================================
     template <bool Punchy>
-    FORCE_INLINE int vectorSynthesizeTriangleTemplated(struct Grain& grain,
-        float* outL, float* outR, int blockSize, int bufferLength)
+    FORCE_INLINE int vectorSynthesizeTriangleContiguous(struct Grain& grain,
+        float* outL, float* outR,
+        int blockSize)
     {
         auto& st = grain.linearState;
         if (st.atEnd() || !grain.active)
@@ -411,76 +667,175 @@ namespace project
             grain.active = false;
             return 0;
         }
-        int processed = 0, remaining = blockSize;
+
+        int processed = 0;
+        int remaining = blockSize;
+
         const float leftGain = 0.5f * (1.0f - grain.essence.panning);
         const float rightGain = 0.5f * (1.0f + grain.essence.panning);
         const float* srcL = grain.sourceL;
         const float* srcR = grain.sourceR;
-        bool contiguous = ((grain.essence.startOffsetInSamples + static_cast<float>(grain.sourceReadLength)) < bufferLength);
 
-        if (st.nextBoundary(remaining) == remaining)
+        while (remaining > 0 && !st.atEnd())
         {
-            for (int i = 0; i < remaining; ++i)
+            int boundary = st.nextBoundary(remaining);
+
+            if (boundary >= remaining)
             {
-                float env = st.synthesize();
-                int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
-                float frac = (grain.phaseAcc & FIXED_MASK) / static_cast<float>(FIXED_ONE);
-                if (contiguous)
+                for (int i = 0; i < remaining; ++i)
                 {
-                    outL[processed + i] += (srcL[idx] + frac * (srcL[idx + 1] - srcL[idx])) * (env * leftGain);
-                    outR[processed + i] += (srcR[idx] + frac * (srcR[idx + 1] - srcR[idx])) * (env * rightGain);
+                    float env = st.synthesize();
+                    int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
+                    float frac = (grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+
+                    float sampL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
+                    float sampR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
+
+                    outL[processed + i] += sampL * (env * leftGain);
+                    outR[processed + i] += sampR * (env * rightGain);
+
+                    grain.phaseAcc += grain.phaseInc;
                 }
-                else
-                {
-                    int wrappedIdx0 = idx & (bufferLength - 1);
-                    int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
-                    outL[processed + i] += (srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0])) * (env * leftGain);
-                    outR[processed + i] += (srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0])) * (env * rightGain);
-                }
-                grain.phaseAcc += grain.phaseInc;
+                st.checkBoundary(remaining);
+                processed += remaining;
+                remaining = 0;
             }
-            processed += remaining;
-            st.checkBoundary(remaining);
-        }
-        else
-        {
-            while (remaining > 0 && !st.atEnd())
+            else
             {
-                int boundary = st.nextBoundary(remaining);
                 for (int i = 0; i < boundary; ++i)
                 {
                     float env = st.synthesize();
                     int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
-                    float frac = (grain.phaseAcc & FIXED_MASK) / static_cast<float>(FIXED_ONE);
-                    float sampleL, sampleR;
-                    if (contiguous)
-                    {
-                        sampleL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
-                        sampleR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
-                    }
-                    else
-                    {
-                        int wrappedIdx0 = idx & (bufferLength - 1);
-                        int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
-                        sampleL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
-                        sampleR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
-                    }
-                    outL[processed + i] += sampleL * (env * leftGain);
-                    outR[processed + i] += sampleR * (env * rightGain);
+                    float frac = (grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+
+                    float sampL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
+                    float sampR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
+
+                    outL[processed + i] += sampL * (env * leftGain);
+                    outR[processed + i] += sampR * (env * rightGain);
+
                     grain.phaseAcc += grain.phaseInc;
                 }
+                st.checkBoundary(boundary);
                 processed += boundary;
                 remaining -= boundary;
-                st.checkBoundary(boundary);
             }
         }
-        if (st.atEnd()) grain.active = false;
+
+        if (st.atEnd())
+            grain.active = false;
+
         return processed;
     }
 
     template <bool Punchy>
-    FORCE_INLINE int vectorSynthesizeASRTemplated(struct Grain& grain,
-        float* outL, float* outR, int blockSize, int bufferLength)
+    FORCE_INLINE int vectorSynthesizeTriangleWrap(struct Grain& grain,
+        float* outL, float* outR,
+        int blockSize, int bufferLength)
+    {
+        auto& st = grain.linearState;
+        if (st.atEnd() || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+
+        int processed = 0;
+        int remaining = blockSize;
+
+        const float leftGain = 0.5f * (1.0f - grain.essence.panning);
+        const float rightGain = 0.5f * (1.0f + grain.essence.panning);
+        const float* srcL = grain.sourceL;
+        const float* srcR = grain.sourceR;
+
+        while (remaining > 0 && !st.atEnd())
+        {
+            int boundary = st.nextBoundary(remaining);
+
+            if (boundary >= remaining)
+            {
+                for (int i = 0; i < remaining; ++i)
+                {
+                    float env = st.synthesize();
+                    int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
+                    float frac = (grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+
+                    int wrappedIdx0 = idx & (bufferLength - 1);
+                    int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
+
+                    float sampL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
+                    float sampR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
+
+                    outL[processed + i] += sampL * (env * leftGain);
+                    outR[processed + i] += sampR * (env * rightGain);
+
+                    grain.phaseAcc += grain.phaseInc;
+                }
+                st.checkBoundary(remaining);
+                processed += remaining;
+                remaining = 0;
+            }
+            else
+            {
+                for (int i = 0; i < boundary; ++i)
+                {
+                    float env = st.synthesize();
+                    int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
+                    float frac = (grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+
+                    int wrappedIdx0 = idx & (bufferLength - 1);
+                    int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
+
+                    float sampL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
+                    float sampR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
+
+                    outL[processed + i] += sampL * (env * leftGain);
+                    outR[processed + i] += sampR * (env * rightGain);
+
+                    grain.phaseAcc += grain.phaseInc;
+                }
+                st.checkBoundary(boundary);
+                processed += boundary;
+                remaining -= boundary;
+            }
+        }
+
+        if (st.atEnd())
+            grain.active = false;
+
+        return processed;
+    }
+
+    template <bool Punchy>
+    FORCE_INLINE int vectorSynthesizeTriangleTemplated(struct Grain& grain,
+        float* outL, float* outR,
+        int blockSize, int bufferLength)
+    {
+        auto& st = grain.linearState;
+        if (st.atEnd() || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+
+        bool contiguous = (
+            (grain.essence.startOffsetInSamples + float(grain.sourceReadLength))
+            < bufferLength
+            );
+
+        if (contiguous)
+            return vectorSynthesizeTriangleContiguous<Punchy>(grain, outL, outR, blockSize);
+        else
+            return vectorSynthesizeTriangleWrap<Punchy>(grain, outL, outR, blockSize, bufferLength);
+    }
+
+    //==============================================================================
+    // 3) HELPER FUNCTIONS FOR ASR (CONTIGUOUS / WRAP)
+    //==============================================================================
+    template <bool Punchy>
+    FORCE_INLINE int vectorSynthesizeASRContiguous(struct Grain& grain,
+        float* outL, float* outR,
+        int blockSize)
     {
         auto& st = grain.asrState;
         if (st.atEnd() || !grain.active)
@@ -488,75 +843,173 @@ namespace project
             grain.active = false;
             return 0;
         }
-        int processed = 0, remaining = blockSize;
+
+        int processed = 0;
+        int remaining = blockSize;
+
         const float leftGain = 0.5f * (1.0f - grain.essence.panning);
         const float rightGain = 0.5f * (1.0f + grain.essence.panning);
         const float* srcL = grain.sourceL;
         const float* srcR = grain.sourceR;
-        bool contiguous = ((grain.essence.startOffsetInSamples + static_cast<float>(grain.sourceReadLength)) < bufferLength);
 
-        if (st.nextBoundary(remaining) == remaining)
+        while (remaining > 0 && !st.atEnd())
         {
-            for (int i = 0; i < remaining; ++i)
+            int boundary = st.nextBoundary(remaining);
+
+            if (boundary >= remaining)
             {
-                float env = st.synthesize();
-                int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
-                float frac = (grain.phaseAcc & FIXED_MASK) / static_cast<float>(FIXED_ONE);
-                if (contiguous)
+                for (int i = 0; i < remaining; ++i)
                 {
-                    outL[processed + i] += (srcL[idx] + frac * (srcL[idx + 1] - srcL[idx])) * (env * leftGain);
-                    outR[processed + i] += (srcR[idx] + frac * (srcR[idx + 1] - srcR[idx])) * (env * rightGain);
+                    float env = st.synthesize();
+                    int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
+                    float frac = (grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+
+                    float sampL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
+                    float sampR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
+
+                    outL[processed + i] += sampL * (env * leftGain);
+                    outR[processed + i] += sampR * (env * rightGain);
+
+                    grain.phaseAcc += grain.phaseInc;
                 }
-                else
-                {
-                    int wrappedIdx0 = idx & (bufferLength - 1);
-                    int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
-                    outL[processed + i] += (srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0])) * (env * leftGain);
-                    outR[processed + i] += (srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0])) * (env * rightGain);
-                }
-                grain.phaseAcc += grain.phaseInc;
+                st.checkBoundary(remaining);
+                processed += remaining;
+                remaining = 0;
             }
-            processed += remaining;
-            st.checkBoundary(remaining);
-        }
-        else
-        {
-            while (remaining > 0 && !st.atEnd())
+            else
             {
-                int boundary = st.nextBoundary(remaining);
                 for (int i = 0; i < boundary; ++i)
                 {
                     float env = st.synthesize();
                     int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
-                    float frac = (grain.phaseAcc & FIXED_MASK) / static_cast<float>(FIXED_ONE);
-                    float sampleL, sampleR;
-                    if (contiguous)
-                    {
-                        sampleL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
-                        sampleR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
-                    }
-                    else
-                    {
-                        int wrappedIdx0 = idx & (bufferLength - 1);
-                        int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
-                        sampleL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
-                        sampleR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
-                    }
-                    outL[processed + i] += sampleL * (env * leftGain);
-                    outR[processed + i] += sampleR * (env * rightGain);
+                    float frac = (grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+
+                    float sampL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
+                    float sampR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
+
+                    outL[processed + i] += sampL * (env * leftGain);
+                    outR[processed + i] += sampR * (env * rightGain);
+
                     grain.phaseAcc += grain.phaseInc;
                 }
+                st.checkBoundary(boundary);
                 processed += boundary;
                 remaining -= boundary;
-                st.checkBoundary(boundary);
             }
         }
-        if (st.atEnd()) grain.active = false;
+
+        if (st.atEnd())
+            grain.active = false;
+
         return processed;
+    }
+
+    template <bool Punchy>
+    FORCE_INLINE int vectorSynthesizeASRWrap(struct Grain& grain,
+        float* outL, float* outR,
+        int blockSize, int bufferLength)
+    {
+        auto& st = grain.asrState;
+        if (st.atEnd() || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+
+        int processed = 0;
+        int remaining = blockSize;
+
+        const float leftGain = 0.5f * (1.0f - grain.essence.panning);
+        const float rightGain = 0.5f * (1.0f + grain.essence.panning);
+        const float* srcL = grain.sourceL;
+        const float* srcR = grain.sourceR;
+
+        while (remaining > 0 && !st.atEnd())
+        {
+            int boundary = st.nextBoundary(remaining);
+
+            if (boundary >= remaining)
+            {
+                for (int i = 0; i < remaining; ++i)
+                {
+                    float env = st.synthesize();
+                    int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
+                    float frac = (grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+
+                    int wrappedIdx0 = idx & (bufferLength - 1);
+                    int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
+
+                    float sampL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
+                    float sampR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
+
+                    outL[processed + i] += sampL * (env * leftGain);
+                    outR[processed + i] += sampR * (env * rightGain);
+
+                    grain.phaseAcc += grain.phaseInc;
+                }
+                st.checkBoundary(remaining);
+                processed += remaining;
+                remaining = 0;
+            }
+            else
+            {
+                for (int i = 0; i < boundary; ++i)
+                {
+                    float env = st.synthesize();
+                    int idx = static_cast<int>(grain.phaseAcc >> FIXED_SHIFT);
+                    float frac = (grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
+
+                    int wrappedIdx0 = idx & (bufferLength - 1);
+                    int wrappedIdx1 = (wrappedIdx0 + 1) & (bufferLength - 1);
+
+                    float sampL = srcL[wrappedIdx0] + frac * (srcL[wrappedIdx1] - srcL[wrappedIdx0]);
+                    float sampR = srcR[wrappedIdx0] + frac * (srcR[wrappedIdx1] - srcR[wrappedIdx0]);
+
+                    outL[processed + i] += sampL * (env * leftGain);
+                    outR[processed + i] += sampR * (env * rightGain);
+
+                    grain.phaseAcc += grain.phaseInc;
+                }
+                st.checkBoundary(boundary);
+                processed += boundary;
+                remaining -= boundary;
+            }
+        }
+
+        if (st.atEnd())
+            grain.active = false;
+
+        return processed;
+    }
+
+    template <bool Punchy>
+    FORCE_INLINE int vectorSynthesizeASRTemplated(struct Grain& grain,
+        float* outL, float* outR,
+        int blockSize, int bufferLength)
+    {
+        auto& st = grain.asrState;
+        if (st.atEnd() || !grain.active)
+        {
+            grain.active = false;
+            return 0;
+        }
+
+        bool contiguous = (
+            (grain.essence.startOffsetInSamples + float(grain.sourceReadLength))
+            < bufferLength
+            );
+
+        if (contiguous)
+            return vectorSynthesizeASRContiguous<Punchy>(grain, outL, outR, blockSize);
+        else
+            return vectorSynthesizeASRWrap<Punchy>(grain, outL, outR, blockSize, bufferLength);
     }
 
     //==============================================================================
     // Non-templated wrappers for runtime dispatch.
+    // (These remain exactly the same calls, but now each calls
+    //  our new "Contiguous vs. Wrap" approach internally.)
+    //==============================================================================
     static int vectorSynthesizeParabolic(struct Grain& grain,
         float* outL, float* outR, int blockSize, int bufferLength)
     {
@@ -595,7 +1048,10 @@ namespace project
 
     //==============================================================================
     // Grain structure with placement-new based activation.
-    // We now add a fixed-point phase accumulator (phaseAcc) and its increment (phaseInc) in Q16.16 format.
+    // (Below is the original unchanged, except references to
+    //  the new 'vectorSynthesizeXYZTemplated' calls are done
+    //  through the same envelopeRenderFn pointers.)
+    //==============================================================================
     struct Grain
     {
         const float* sourceL = nullptr;
@@ -645,6 +1101,8 @@ namespace project
             envelopeRenderFn = fn;
             int durSamples = static_cast<int>(std::lround(duration));
             if (durSamples < 1) durSamples = 1;
+
+            // Envelope initialization
             if (fn == &vectorSynthesizeParabolic)
                 parabState.initNormal(grainAmplitude, durSamples);
             else if (fn == &vectorSynthesizePunchyParabolic)
@@ -657,6 +1115,7 @@ namespace project
                 asrState.initNormal(grainAmplitude, durSamples);
             else
                 asrState.initPunchy(grainAmplitude, durSamples);
+
             // Initialize fixed-point phase accumulator:
             phaseAcc = 0;
             phaseInc = static_cast<uint32_t>((sourceReadLength * FIXED_ONE) / duration);
@@ -674,6 +1133,8 @@ namespace project
 
     //==============================================================================
     // Scheduling Functions using placement-new on fixed pools.
+    // (Unchanged from original)
+    //==============================================================================
     struct Granular_Synth_2_Helper
     {
         static void scheduleGrainNormal(
@@ -695,7 +1156,8 @@ namespace project
             {
                 if (!g.isActive())
                 {
-                    new(&g) Grain(grainDuration, baseDelta, sample, grainAmp, essence, bufferLen, normalEnvelopeFn);
+                    new(&g) Grain(grainDuration, baseDelta, sample, grainAmp,
+                        essence, bufferLen, normalEnvelopeFn);
                     break;
                 }
             }
@@ -722,7 +1184,8 @@ namespace project
                 {
                     if (!g.isActive())
                     {
-                        new(&g) Grain(grainDuration, baseDelta, sample, grainAmp, essence, bufferLen, punchyEnvelopeFn);
+                        new(&g) Grain(grainDuration, baseDelta, sample, grainAmp,
+                            essence, bufferLen, punchyEnvelopeFn);
                         firstGrainScheduled = true;
                         break;
                     }
@@ -734,7 +1197,8 @@ namespace project
                 {
                     if (!g.isActive())
                     {
-                        new(&g) Grain(grainDuration, baseDelta, sample, grainAmp, essence, bufferLen, normalEnvelopeFn);
+                        new(&g) Grain(grainDuration, baseDelta, sample, grainAmp,
+                            essence, bufferLen, normalEnvelopeFn);
                         break;
                     }
                 }
@@ -757,6 +1221,9 @@ namespace project
 
     //==============================================================================
     // Granular_Synth Class Template
+    // (All of this remains identical, except that the envelope functions now
+    //  use our newly flattened boundary loops and hoisted contiguous checks.)
+    //==============================================================================
     template <int NV>
     struct Granular_Synth : public data::base
     {
@@ -889,7 +1356,7 @@ namespace project
             globalPitchOffsetFactor = std::pow(2.0, grainPitchOffsetSemitones / 12.0);
             int currentSampleLength = sampleBuffer.getNumSamples();
             if (currentSampleLength < 1) currentSampleLength = 1;
-            grainStartOffsetInSamples = grainStartPercent * static_cast<float>(currentSampleLength - 1);
+            grainStartOffsetInSamples = grainStartPercent * float(currentSampleLength - 1);
             raisedCosAttackSamples = static_cast<int>(std::lround(0.02 * sampleRate));
             raisedCosReleaseSamples = static_cast<int>(std::lround(0.02 * sampleRate));
         }
@@ -964,13 +1431,16 @@ namespace project
             }
             std::fill(leftChannel, leftChannel + totalSamples, 0.0f);
             std::fill(rightChannel, rightChannel + totalSamples, 0.0f);
+
             if (tempBlockOutL.size() < static_cast<size_t>(totalSamples))
             {
                 tempBlockOutL.resize(totalSamples, 0.f);
                 tempBlockOutR.resize(totalSamples, 0.f);
             }
+
             const int sampleLen = sampleBuffer.getNumSamples();
             int globalOffset = 0;
+
             while (globalOffset < totalSamples)
             {
                 int nextEvent = totalSamples - globalOffset;
@@ -990,9 +1460,12 @@ namespace project
                             nextEvent = std::min(nextEvent, static_cast<int>(grain.duration - grain.position));
                     }
                 }
-                if (nextEvent < 1) nextEvent = 1;
+                if (nextEvent < 1)
+                    nextEvent = 1;
+
                 std::fill(tempBlockOutL.begin(), tempBlockOutL.begin() + nextEvent, 0.f);
                 std::fill(tempBlockOutR.begin(), tempBlockOutR.begin() + nextEvent, 0.f);
+
                 // Reuse activeGrains vector.
                 activeGrains.clear();
                 for (auto& voice : voices)
@@ -1009,18 +1482,21 @@ namespace project
                             activeGrains.push_back(&grain);
                     }
                 }
+
                 // Process all active grains.
                 for (auto* gptr : activeGrains)
                 {
                     int n = gptr->vectorSynthesize(tempBlockOutL.data(), tempBlockOutR.data(), nextEvent, sampleLen);
                     gptr->position += n;
                 }
+
                 // Add synthesized block to output.
                 for (int i = 0; i < nextEvent; ++i)
                 {
                     leftChannel[globalOffset + i] += tempBlockOutL[i];
                     rightChannel[globalOffset + i] += tempBlockOutR[i];
                 }
+
                 // Update scheduler.
                 for (auto& voice : voices)
                 {
@@ -1028,27 +1504,36 @@ namespace project
                     voice.grainSchedulerCounter -= nextEvent;
                     while (voice.grainSchedulerCounter <= 0)
                     {
-                        double baseDelta = pitchRatios[voice.midiNote] * sampleRateRatio * globalPitchOffsetFactor;
+                        double baseDelta = pitchRatios[voice.midiNote]
+                            * sampleRateRatio
+                            * globalPitchOffsetFactor;
                         double grainDuration = static_cast<double>(grainSizeInSamples);
+
                         GrainEssence essence;
                         {
                             std::uniform_real_distribution<double> pitchOffDist(-grainOffsetCentsRange, grainOffsetCentsRange);
                             essence.pitchOffsetCents = pitchOffDist(randomGen);
+
                             std::uniform_real_distribution<float> volDist(grainVolumeMin, 1.0f);
                             essence.volumeMult = volDist(randomGen);
+
                             std::uniform_real_distribution<float> panDist(-grainPanRange, grainPanRange);
                             essence.panning = panDist(randomGen);
+
                             std::uniform_int_distribution<int> gapDist(0, static_cast<int>(std::lround(grainGapAdjustmentMaxSec * sampleRate)));
                             essence.gapAdjustment = gapDist(randomGen);
+
                             std::uniform_real_distribution<float> sizeDist(1.0f - grainSizeRandom, 1.0f);
                             essence.sizeMult = sizeDist(randomGen);
+
                             float finalStartOffset = grainStartOffsetInSamples;
                             if (startModEnabled && startModTimeSec > 0.00001)
                             {
                                 int samplesPassed = grainIntervalInSamples + essence.gapAdjustment;
-                                double timeSec = static_cast<double>(samplesPassed) / sampleRate;
+                                double timeSec = double(samplesPassed) / sampleRate;
                                 double cycleTime = startModTimeSec;
                                 double increment = timeSec / cycleTime;
+
                                 voice.modPhase += increment * voice.scanDirection;
                                 if (voice.modPhase >= 1.0)
                                 {
@@ -1061,28 +1546,34 @@ namespace project
                                     voice.scanDirection = 1.0;
                                 }
                                 float curPercent = static_cast<float>(voice.modPhase);
-                                finalStartOffset = curPercent * (static_cast<float>(sampleLen) - 1);
+                                finalStartOffset = curPercent * float(sampleLen - 1);
                             }
                             if (grainSpray > 0.0f)
                             {
                                 std::uniform_real_distribution<float> sprayDist(0.0f, 1.0f);
                                 float rnd = sprayDist(randomGen);
-                                float left = -grainSprayMode * grainSpray * static_cast<float>(sampleLen);
-                                float range = grainSpray * (1.0f + grainSprayMode) * static_cast<float>(sampleLen);
+                                float left = -grainSprayMode * grainSpray * float(sampleLen);
+                                float range = grainSpray * (1.0f + grainSprayMode) * float(sampleLen);
                                 float offset = left + rnd * range;
                                 finalStartOffset += offset;
                             }
                             if (grainSprayMode >= 0.5f)
                             {
                                 int idx = static_cast<int>(finalStartOffset);
-                                float frac = finalStartOffset - static_cast<float>(idx);
+                                float frac = finalStartOffset - float(idx);
                                 int wrappedIdx = idx & (sampleLen - 1);
-                                finalStartOffset = static_cast<float>(wrappedIdx) + frac;
+                                finalStartOffset = float(wrappedIdx) + frac;
                             }
-                            else { if (finalStartOffset < 0.f) finalStartOffset = 0.f; }
+                            else
+                            {
+                                if (finalStartOffset < 0.f)
+                                    finalStartOffset = 0.f;
+                            }
                             essence.startOffsetInSamples = finalStartOffset;
                         }
+
                         float grainAmp = voice.velocity;
+
                         scheduleGrainFn(
                             voice.firstGrainScheduled,
                             voice.punchyGrainPool,
@@ -1268,7 +1759,7 @@ namespace project
         void initPitchRatios()
         {
             for (int i = 0; i < 128; ++i)
-                pitchRatios[i] = std::pow(2.0f, (float)(i - 60) / 12.0f);
+                pitchRatios[i] = std::pow(2.0f, float(i - 60) / 12.0f);
         }
     };
 
