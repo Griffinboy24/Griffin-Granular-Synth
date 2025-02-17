@@ -46,6 +46,7 @@ namespace project
         int    gapAdjustment = 0;
         float  sizeMult = 1.0f;
         float  startOffsetInSamples = 0.0f;  // Non-wrapping offset.
+        bool   reverse = false;              // New: if true, play grain backwards.
     };
 
     //==============================================================================
@@ -333,8 +334,7 @@ namespace project
                 finished = true;
                 return;
             }
-            int attackSamples = (int)std::round((float)durSamples
-                * attackRatio / (attackRatio + sustainRatio + releaseRatio));
+            int attackSamples = (int)std::round((float)durSamples * attackRatio / (attackRatio + sustainRatio + releaseRatio));
             if (attackSamples < 1) attackSamples = 1;
 
             amplitude = 0.f;
@@ -358,8 +358,7 @@ namespace project
                 finished = true;
                 return;
             }
-            int attackSamples = (int)std::round((float)durSamples
-                * attackRatio / (attackRatio + releaseRatio));
+            int attackSamples = (int)std::round((float)durSamples * attackRatio / (attackRatio + releaseRatio));
             if (attackSamples < 1) attackSamples = 1;
 
             amplitude = gA;
@@ -394,10 +393,8 @@ namespace project
                 // 3-segment: Attack -> Sustain -> Release
                 if (segmentIndex == 0)
                 {
-                    // Attack -> Sustain
                     segmentIndex = 1;
-                    int sustainSamples = (int)std::round((float)totalSamples
-                        * sustainRatio / (attackRatio + sustainRatio + releaseRatio));
+                    int sustainSamples = (int)std::round((float)totalSamples * sustainRatio / (attackRatio + sustainRatio + releaseRatio));
                     if (sustainSamples < 1)
                     {
                         finished = true;
@@ -409,11 +406,8 @@ namespace project
                 }
                 else if (segmentIndex == 1)
                 {
-                    // Sustain -> Release
                     segmentIndex = 2;
-                    int releaseSamples = totalSamples -
-                        (int)std::round((float)totalSamples
-                            * (attackRatio + sustainRatio) / (attackRatio + sustainRatio + releaseRatio));
+                    int releaseSamples = totalSamples - (int)std::round((float)totalSamples * (attackRatio + sustainRatio) / (attackRatio + sustainRatio + releaseRatio));
                     if (releaseSamples < 1)
                     {
                         finished = true;
@@ -434,9 +428,7 @@ namespace project
                 if (segmentIndex == 0)
                 {
                     segmentIndex = 1;
-                    int releaseSamples = totalSamples -
-                        (int)std::round((float)totalSamples
-                            * attackRatio / (attackRatio + releaseRatio));
+                    int releaseSamples = totalSamples - (int)std::round((float)totalSamples * attackRatio / (attackRatio + releaseRatio));
                     if (releaseSamples < 1)
                     {
                         finished = true;
@@ -460,15 +452,11 @@ namespace project
     // 64-bit fixed-point accumulators for linear reading (NO WRAP).
     //==============================================================================
     static constexpr int      FIXED_SHIFT = 16;
-    static constexpr uint64_t FIXED_ONE = (uint64_t)1 << FIXED_SHIFT;
-    static constexpr uint64_t FIXED_MASK = FIXED_ONE - 1ULL;
+    static constexpr int64_t  FIXED_ONE = (int64_t)1 << FIXED_SHIFT;
+    static constexpr int64_t  FIXED_MASK = FIXED_ONE - 1;
 
     //==============================================================================
     // 1) Parabolic (No Wrap)
-    //==============================================================================
-    /** Template for parabolic envelope with or without Punchy mode, but now
-        we do NOT do ring-buffer or bitmask wrapping. If we exceed the buffer end,
-        we end the grain. */
     template <bool Punchy>
     FORCE_INLINE int vectorSynthesizeParabolicNoWrap(struct Grain& grain,
         float* outL,
@@ -482,45 +470,45 @@ namespace project
             grain.active = false;
             return 0;
         }
-
         int processed = 0;
         int remaining = blockSize;
-
         const float leftGain = 0.5f * (1.f - grain.essence.panning);
         const float rightGain = 0.5f * (1.f + grain.essence.panning);
         const float* srcL = grain.sourceL;
         const float* srcR = grain.sourceR;
-
         while (remaining > 0 && !st.atEnd())
         {
             int boundary = st.nextBoundary(remaining);
-
             if (boundary >= remaining)
             {
                 for (int i = 0; i < remaining; ++i)
                 {
                     float env = st.synthesize();
-
-                    uint64_t acc = grain.phaseAcc >> FIXED_SHIFT;
+                    int64_t acc = grain.phaseAcc >> FIXED_SHIFT;
                     int idx = (int)acc;
-
-                    if (idx >= (bufferLength - 1))
+                    if (!grain.essence.reverse)
                     {
-                        st.finished = true;
-                        break;
+                        if (idx >= (bufferLength - 1))
+                        {
+                            st.finished = true;
+                            break;
+                        }
                     }
-
+                    else
+                    {
+                        if (idx < 0)
+                        {
+                            st.finished = true;
+                            break;
+                        }
+                    }
                     float frac = float(grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
-
                     float sampL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
                     float sampR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
-
                     outL[processed + i] += sampL * (env * leftGain);
                     outR[processed + i] += sampR * (env * rightGain);
-
                     grain.phaseAcc += grain.phaseInc;
                 }
-
                 st.checkBoundary(remaining);
                 processed += remaining;
                 remaining = 0;
@@ -530,40 +518,41 @@ namespace project
                 for (int i = 0; i < boundary; ++i)
                 {
                     float env = st.synthesize();
-
-                    uint64_t acc = grain.phaseAcc >> FIXED_SHIFT;
+                    int64_t acc = grain.phaseAcc >> FIXED_SHIFT;
                     int idx = (int)acc;
-
-                    if (idx >= (bufferLength - 1))
+                    if (!grain.essence.reverse)
                     {
-                        st.finished = true;
-                        break;
+                        if (idx >= (bufferLength - 1))
+                        {
+                            st.finished = true;
+                            break;
+                        }
                     }
-
+                    else
+                    {
+                        if (idx < 0)
+                        {
+                            st.finished = true;
+                            break;
+                        }
+                    }
                     float frac = float(grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
-
                     float sampL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
                     float sampR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
-
                     outL[processed + i] += sampL * (env * leftGain);
                     outR[processed + i] += sampR * (env * rightGain);
-
                     grain.phaseAcc += grain.phaseInc;
                 }
-
                 st.checkBoundary(boundary);
                 processed += boundary;
                 remaining -= boundary;
             }
         }
-
         if (st.atEnd())
             grain.active = false;
-
         return processed;
     }
 
-    // Non-templated dispatch:
     static int vectorSynthesizeParabolic(struct Grain& grain,
         float* outL,
         float* outR,
@@ -582,8 +571,6 @@ namespace project
     }
 
     //==============================================================================
-    // 2) Triangle (No Wrap)
-    //==============================================================================
     template <bool Punchy>
     FORCE_INLINE int vectorSynthesizeTriangleNoWrap(struct Grain& grain,
         float* outL,
@@ -597,42 +584,43 @@ namespace project
             grain.active = false;
             return 0;
         }
-
         int processed = 0;
         int remaining = blockSize;
-
         const float leftGain = 0.5f * (1.f - grain.essence.panning);
         const float rightGain = 0.5f * (1.f + grain.essence.panning);
         const float* srcL = grain.sourceL;
         const float* srcR = grain.sourceR;
-
         while (remaining > 0 && !st.atEnd())
         {
             int boundary = st.nextBoundary(remaining);
-
             if (boundary >= remaining)
             {
                 for (int i = 0; i < remaining; ++i)
                 {
                     float env = st.synthesize();
-
-                    uint64_t acc = grain.phaseAcc >> FIXED_SHIFT;
+                    int64_t acc = grain.phaseAcc >> FIXED_SHIFT;
                     int idx = (int)acc;
-
-                    if (idx >= bufferLength - 1)
+                    if (!grain.essence.reverse)
                     {
-                        st.finished = true;
-                        break;
+                        if (idx >= (bufferLength - 1))
+                        {
+                            st.finished = true;
+                            break;
+                        }
                     }
-
+                    else
+                    {
+                        if (idx < 0)
+                        {
+                            st.finished = true;
+                            break;
+                        }
+                    }
                     float frac = float(grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
-
                     float sampL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
                     float sampR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
-
                     outL[processed + i] += sampL * (env * leftGain);
                     outR[processed + i] += sampR * (env * rightGain);
-
                     grain.phaseAcc += grain.phaseInc;
                 }
                 st.checkBoundary(remaining);
@@ -644,24 +632,29 @@ namespace project
                 for (int i = 0; i < boundary; ++i)
                 {
                     float env = st.synthesize();
-
-                    uint64_t acc = grain.phaseAcc >> FIXED_SHIFT;
+                    int64_t acc = grain.phaseAcc >> FIXED_SHIFT;
                     int idx = (int)acc;
-
-                    if (idx >= bufferLength - 1)
+                    if (!grain.essence.reverse)
                     {
-                        st.finished = true;
-                        break;
+                        if (idx >= (bufferLength - 1))
+                        {
+                            st.finished = true;
+                            break;
+                        }
                     }
-
+                    else
+                    {
+                        if (idx < 0)
+                        {
+                            st.finished = true;
+                            break;
+                        }
+                    }
                     float frac = float(grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
-
                     float sampL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
                     float sampR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
-
                     outL[processed + i] += sampL * (env * leftGain);
                     outR[processed + i] += sampR * (env * rightGain);
-
                     grain.phaseAcc += grain.phaseInc;
                 }
                 st.checkBoundary(boundary);
@@ -669,14 +662,11 @@ namespace project
                 remaining -= boundary;
             }
         }
-
         if (st.atEnd())
             grain.active = false;
-
         return processed;
     }
 
-    // Non-templated
     static int vectorSynthesizeTriangle(struct Grain& grain,
         float* outL,
         float* outR,
@@ -695,8 +685,6 @@ namespace project
     }
 
     //==============================================================================
-    // 3) ASR (No Wrap)
-    //==============================================================================
     template <bool Punchy>
     FORCE_INLINE int vectorSynthesizeASRNoWrap(struct Grain& grain,
         float* outL,
@@ -710,42 +698,43 @@ namespace project
             grain.active = false;
             return 0;
         }
-
         int processed = 0;
         int remaining = blockSize;
-
         const float leftGain = 0.5f * (1.f - grain.essence.panning);
         const float rightGain = 0.5f * (1.f + grain.essence.panning);
         const float* srcL = grain.sourceL;
         const float* srcR = grain.sourceR;
-
         while (remaining > 0 && !st.atEnd())
         {
             int boundary = st.nextBoundary(remaining);
-
             if (boundary >= remaining)
             {
                 for (int i = 0; i < remaining; ++i)
                 {
                     float env = st.synthesize();
-
-                    uint64_t acc = grain.phaseAcc >> FIXED_SHIFT;
+                    int64_t acc = grain.phaseAcc >> FIXED_SHIFT;
                     int idx = (int)acc;
-
-                    if (idx >= bufferLength - 1)
+                    if (!grain.essence.reverse)
                     {
-                        st.finished = true;
-                        break;
+                        if (idx >= (bufferLength - 1))
+                        {
+                            st.finished = true;
+                            break;
+                        }
                     }
-
+                    else
+                    {
+                        if (idx < 0)
+                        {
+                            st.finished = true;
+                            break;
+                        }
+                    }
                     float frac = float(grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
-
                     float sampL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
                     float sampR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
-
                     outL[processed + i] += sampL * (env * leftGain);
                     outR[processed + i] += sampR * (env * rightGain);
-
                     grain.phaseAcc += grain.phaseInc;
                 }
                 st.checkBoundary(remaining);
@@ -757,24 +746,29 @@ namespace project
                 for (int i = 0; i < boundary; ++i)
                 {
                     float env = st.synthesize();
-
-                    uint64_t acc = grain.phaseAcc >> FIXED_SHIFT;
+                    int64_t acc = grain.phaseAcc >> FIXED_SHIFT;
                     int idx = (int)acc;
-
-                    if (idx >= bufferLength - 1)
+                    if (!grain.essence.reverse)
                     {
-                        st.finished = true;
-                        break;
+                        if (idx >= (bufferLength - 1))
+                        {
+                            st.finished = true;
+                            break;
+                        }
                     }
-
+                    else
+                    {
+                        if (idx < 0)
+                        {
+                            st.finished = true;
+                            break;
+                        }
+                    }
                     float frac = float(grain.phaseAcc & FIXED_MASK) / float(FIXED_ONE);
-
                     float sampL = srcL[idx] + frac * (srcL[idx + 1] - srcL[idx]);
                     float sampR = srcR[idx] + frac * (srcR[idx + 1] - srcR[idx]);
-
                     outL[processed + i] += sampL * (env * leftGain);
                     outR[processed + i] += sampR * (env * rightGain);
-
                     grain.phaseAcc += grain.phaseInc;
                 }
                 st.checkBoundary(boundary);
@@ -782,14 +776,11 @@ namespace project
                 remaining -= boundary;
             }
         }
-
         if (st.atEnd())
             grain.active = false;
-
         return processed;
     }
 
-    // Non-templated
     static int vectorSynthesizeASR(struct Grain& grain,
         float* outL,
         float* outR,
@@ -808,33 +799,26 @@ namespace project
     }
 
     //==============================================================================
-    // Grain structure (with 64-bit accum, but NO bitmask).
-    //==============================================================================
+    /** Grain structure (with 64-bit accumulators, now signed for reverse playback). */
     struct Grain
     {
         const float* sourceL = nullptr;
         const float* sourceR = nullptr;
-
-        double position = 0.0;  // track how many samples we've processed
+        double position = 0.0;  // track how many samples processed
         double duration = 0.0;  // total length in samples
         double delta = 0.0;     // base read increment
         double sourceReadLength = 0.0;
         bool   active = false;
-
         float  grainAmplitude = 1.0f;
         GrainEssence essence;
         EnvelopeMode envelopeMode = EnvelopeMode::Parabolic;
-
         using EnvelopeFunction = int(*)(Grain&, float*, float*, int, int);
         EnvelopeFunction envelopeRenderFn = nullptr;
-
         ParabolicEnvelopeState parabState;
         LinearEnvelopeState    linearState;
         ASREnvelopeState       asrState;
-
-        // 64-bit accumulators
-        uint64_t phaseAcc = 0ULL;
-        uint64_t phaseInc = 0ULL;
+        int64_t phaseAcc = 0;
+        int64_t phaseInc = 0;
 
         Grain() noexcept = default;
 
@@ -848,14 +832,11 @@ namespace project
         {
             duration = dur;
             delta = d;
-
             double centsFact = std::pow(2.0, (e.pitchOffsetCents / 1200.0));
             sourceReadLength = (d * centsFact) * dur;
-
             // Apply random size factor:
             duration *= e.sizeMult;
             sourceReadLength *= e.sizeMult;
-
             position = 0.0;
             sourceL = src[0];
             sourceR = src[1];
@@ -863,12 +844,9 @@ namespace project
             active = true;
             essence = e;
             envelopeRenderFn = fn;
-
             int durSamples = (int)std::lround(duration);
             if (durSamples < 1)
                 durSamples = 1;
-
-            // Envelope init
             if (fn == &vectorSynthesizeParabolic)
                 parabState.initNormal(grainAmplitude, durSamples);
             else if (fn == &vectorSynthesizePunchyParabolic)
@@ -881,20 +859,26 @@ namespace project
                 asrState.initNormal(grainAmplitude, durSamples);
             else
                 asrState.initPunchy(grainAmplitude, durSamples);
-
-            // Compute 64-bit phaseInc
             double incD = (double)sourceReadLength * (double)FIXED_ONE / (double)durSamples;
-            phaseInc = (uint64_t)std::llround(incD);
-
-            // Initialize phaseAcc from the user offset, *no wrap*:
+            phaseInc = (int64_t)std::llround(incD);
             float offset = e.startOffsetInSamples;
             if (offset < 0.f)
                 offset = 0.f;
             else if (offset > (float)(bufferLength - 1))
                 offset = (float)(bufferLength - 1);
-
+            // For reversed grains, adjust the start offset so that
+            // reading backwards for the grain's duration does not underflow.
+            if (e.reverse)
+            {
+                double absInc = (double)(std::llabs(phaseInc));
+                double safeStart = (durSamples - 1) * (absInc / (double)FIXED_ONE);
+                if (offset < safeStart)
+                    offset = (float)safeStart;
+            }
             double offs64 = (double)offset * (double)FIXED_ONE;
-            phaseAcc = (uint64_t)std::llround(offs64);
+            phaseAcc = (int64_t)std::llround(offs64);
+            if (e.reverse)
+                phaseInc = -phaseInc;
         }
 
         int vectorSynthesize(float* outL, float* outR, int blockSize, int bufferLength)
@@ -907,8 +891,6 @@ namespace project
         bool isActive() const { return active; }
     };
 
-    //==============================================================================
-    // Scheduling
     //==============================================================================
     struct Granular_Synth_2_Helper
     {
@@ -995,8 +977,6 @@ namespace project
         Grain::EnvelopeFunction);
 
     //==============================================================================
-    // The main Granular_Synth class template
-    //==============================================================================
     template <int NV>
     struct Granular_Synth : public data::base
     {
@@ -1022,26 +1002,21 @@ namespace project
             int   midiNote = 60;
             bool  isActive = false;
             float velocity = 1.0f;
-
             std::array<Grain, 1>  punchyGrainPool;
             std::array<Grain, 20> normalGrainPool;
-
             int    grainSchedulerCounter = 0;
             double grainSchedulerInterval = 0.0;
             double modPhase = 0.0;
             bool   firstGrainScheduled = false;
             double scanDirection = 1.0;
-
             void reset(int note, float vel, int /*unusedSize*/, int intervalSamples)
             {
                 midiNote = note;
                 velocity = vel;
                 isActive = true;
-
                 firstGrainScheduled = false;
                 for (auto& g : punchyGrainPool)  g.active = false;
                 for (auto& g : normalGrainPool)  g.active = false;
-
                 grainSchedulerCounter = 0;
                 grainSchedulerInterval = (double)intervalSamples;
                 modPhase = 0.0;
@@ -1061,10 +1036,8 @@ namespace project
         int    grainIntervalInSamples = 0;
         double globalPitchOffsetFactor = 1.0;
 
-        // grainStartPercent now represents the sample start percentage.
         float  grainStartPercent = 0.0f;
         float  grainStartOffsetInSamples = 0.0f;
-        // New scanEndPercent parameter (percentage relative to sample length)
         float  scanEndPercent = 1.0f;
         double grainPitchOffsetSemitones = 0.0;
         ModValue gate;
@@ -1088,9 +1061,9 @@ namespace project
 
         bool   punchyMode = false;
         int    envelopeType = 0;
-
-        // New: Pitch randomisation mode (0 = normal, 1 = octave mode)
         float  pitchRandMode = 0.0f;
+        // New: Reverse Chance parameter (0–1) determines probability a grain plays backwards.
+        float  reverseChance = 0.0f;
 
         typename Grain::EnvelopeFunction normalEnvelopeFn = &vectorSynthesizeParabolic;
         typename Grain::EnvelopeFunction punchyEnvelopeFn = &vectorSynthesizePunchyParabolic;
@@ -1103,10 +1076,8 @@ namespace project
         {
             sampleData = ed;
             AudioSampleBuffer tempBuf = ed.toAudioSampleBuffer();
-
             int numSamples = tempBuf.getNumSamples();
             int numChannels = tempBuf.getNumChannels();
-
             if (numSamples <= 0)
             {
                 int fallbackLen = 8;
@@ -1119,13 +1090,11 @@ namespace project
             {
                 sampleBuffer.makeCopyOf(tempBuf, true);
             }
-
             sample[0] = sampleBuffer.getReadPointer(0);
             if (numChannels > 1)
                 sample[1] = sampleBuffer.getReadPointer(1);
             else
                 sample[1] = sample[0];
-
             updateDerivedParameters();
         }
 
@@ -1133,16 +1102,12 @@ namespace project
         {
             grainSizeInSamples = (int)std::lround((grainSizeMS / 1000.0) * sampleRate);
             grainIntervalInSamples = (int)std::lround((grainIntervalMS / 1000.0) * sampleRate);
-
             sampleRateRatio = (sampleData.sampleRate > 0 ? sampleData.sampleRate : 44100.0) / sampleRate;
             globalPitchOffsetFactor = std::pow(2.0, (grainPitchOffsetSemitones / 12.0));
-
             int currentSampleLength = sampleBuffer.getNumSamples();
             if (currentSampleLength < 1)
                 currentSampleLength = 1;
-
             grainStartOffsetInSamples = grainStartPercent * float(currentSampleLength - 1);
-
             raisedCosAttackSamples = (int)std::lround(0.02 * sampleRate);
             raisedCosReleaseSamples = (int)std::lround(0.02 * sampleRate);
         }
@@ -1178,18 +1143,14 @@ namespace project
             initPitchRatios();
             updateDerivedParameters();
             voices.prepare(specs);
-
             activeGrains.clear();
             activeGrains.reserve(NV * 21);
-
             std::random_device rd;
             randomGen.seed(rd());
-
             if (punchyMode)
                 scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainPunchy;
             else
                 scheduleGrainFn = &Granular_Synth_2_Helper::scheduleGrainNormal;
-
             updateEnvelopeFunctions();
         }
 
@@ -1209,41 +1170,32 @@ namespace project
         void process(ProcessDataType& data)
         {
             DataReadLock sl(this->sampleData);
-
             auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
             auto audioBlock = fixData.toAudioBlock();
             auto* leftChannel = audioBlock.getChannelPointer(0);
             auto* rightChannel = audioBlock.getChannelPointer(1);
-
             int totalSamples = data.getNumSamples();
             if (sampleBuffer.getNumSamples() == 0)
             {
                 audioBlock.clear();
                 return;
             }
-
             std::fill(leftChannel, leftChannel + totalSamples, 0.f);
             std::fill(rightChannel, rightChannel + totalSamples, 0.f);
-
             if ((int)tempBlockOutL.size() < totalSamples)
             {
                 tempBlockOutL.resize(totalSamples, 0.f);
                 tempBlockOutR.resize(totalSamples, 0.f);
             }
-
             const int sampleLen = sampleBuffer.getNumSamples();
             int globalOffset = 0;
-
             while (globalOffset < totalSamples)
             {
                 int nextEvent = totalSamples - globalOffset;
-
                 for (auto& voice : voices)
                 {
                     if (!voice.isActive) continue;
-
                     nextEvent = std::min(nextEvent, voice.grainSchedulerCounter);
-
                     for (auto& grain : voice.normalGrainPool)
                     {
                         if (grain.active)
@@ -1263,10 +1215,8 @@ namespace project
                 }
                 if (nextEvent < 1)
                     nextEvent = 1;
-
                 std::fill(tempBlockOutL.begin(), tempBlockOutL.begin() + nextEvent, 0.f);
                 std::fill(tempBlockOutR.begin(), tempBlockOutR.begin() + nextEvent, 0.f);
-
                 activeGrains.clear();
                 for (auto& voice : voices)
                 {
@@ -1276,7 +1226,6 @@ namespace project
                     for (auto& g : voice.normalGrainPool)
                         if (g.active) activeGrains.push_back(&g);
                 }
-
                 for (auto* gptr : activeGrains)
                 {
                     int n = gptr->vectorSynthesize(tempBlockOutL.data(),
@@ -1285,29 +1234,23 @@ namespace project
                         sampleLen);
                     gptr->position += n;
                 }
-
                 for (int i = 0; i < nextEvent; ++i)
                 {
                     leftChannel[globalOffset + i] += tempBlockOutL[i];
                     rightChannel[globalOffset + i] += tempBlockOutR[i];
                 }
-
                 for (auto& voice : voices)
                 {
                     if (!voice.isActive) continue;
-
                     voice.grainSchedulerCounter -= nextEvent;
                     while (voice.grainSchedulerCounter <= 0)
                     {
                         double baseDelta = pitchRatios[voice.midiNote] *
                             sampleRateRatio *
                             globalPitchOffsetFactor;
-
                         double grainDuration = (double)grainSizeInSamples;
-
                         GrainEssence essence;
                         {
-                            // New pitch randomisation behavior:
                             if (pitchRandMode < 0.5f)
                             {
                                 std::uniform_real_distribution<double> pitchDist(-grainOffsetCentsRange, grainOffsetCentsRange);
@@ -1315,8 +1258,6 @@ namespace project
                             }
                             else
                             {
-                                // In octave mode, each grain is either left unchanged or transposed up one octave,
-                                // with a probability given by (grainOffsetCentsRange / 100).
                                 std::uniform_real_distribution<double> chanceDist(0.0, 1.0);
                                 double chance = chanceDist(randomGen);
                                 if (chance < (grainOffsetCentsRange / 100.0))
@@ -1324,28 +1265,21 @@ namespace project
                                 else
                                     essence.pitchOffsetCents = 0.0;
                             }
-
                             std::uniform_real_distribution<float> volDist(grainVolumeMin, 1.f);
                             essence.volumeMult = volDist(randomGen);
-
                             std::uniform_real_distribution<float> panDist(-grainPanRange, grainPanRange);
                             essence.panning = panDist(randomGen);
-
                             std::uniform_int_distribution<int> gapDist(0, (int)std::lround(grainGapAdjustmentMaxSec * sampleRate));
                             essence.gapAdjustment = gapDist(randomGen);
-
                             std::uniform_real_distribution<float> sizeDist((1.f - grainSizeRandom), 1.f);
                             essence.sizeMult = sizeDist(randomGen);
-
                             float finalStartOffset = grainStartOffsetInSamples;
-
                             if (startModEnabled && startModTimeSec > 0.00001)
                             {
                                 int samplesPassed = grainIntervalInSamples + essence.gapAdjustment;
                                 double timeSec = (double)samplesPassed / sampleRate;
                                 double cycleTime = startModTimeSec;
                                 double increment = timeSec / cycleTime;
-
                                 voice.modPhase += increment * voice.scanDirection;
                                 if (voice.modPhase >= 1.0)
                                 {
@@ -1361,7 +1295,6 @@ namespace project
                                 float scanEndOffset = scanEndPercent * float(sampleLen - 1);
                                 finalStartOffset = grainStartOffsetInSamples + (scanEndOffset - grainStartOffsetInSamples) * curPercent;
                             }
-
                             if (grainSpray > 0.f)
                             {
                                 std::uniform_real_distribution<float> rdist(0.f, 1.f);
@@ -1371,15 +1304,13 @@ namespace project
                                 float offset = left + rnd * range;
                                 finalStartOffset += offset;
                             }
-
                             if (finalStartOffset < 0.f)
                                 finalStartOffset = 0.f;
-
                             essence.startOffsetInSamples = finalStartOffset;
+                            std::uniform_real_distribution<double> revDist(0.0, 1.0);
+                            essence.reverse = (revDist(randomGen) < reverseChance);
                         }
-
                         float grainAmp = voice.velocity;
-
                         scheduleGrainFn(
                             voice.firstGrainScheduled,
                             voice.punchyGrainPool,
@@ -1395,11 +1326,9 @@ namespace project
                             normalEnvelopeFn,
                             punchyEnvelopeFn
                         );
-
                         voice.grainSchedulerCounter += (grainIntervalInSamples + essence.gapAdjustment);
                     }
                 }
-
                 globalOffset += nextEvent;
             }
         }
@@ -1415,86 +1344,70 @@ namespace project
         {
             if constexpr (P == 0)
             {
-                // Pitch (semitones)
                 grainPitchOffsetSemitones = v;
                 updateDerivedParameters();
             }
             else if constexpr (P == 1)
             {
-                // Rand Pitch Detune
                 grainOffsetCentsRange = v;
             }
             else if constexpr (P == 2)
             {
-                // Pitch Rand Mode (0 = normal, 1 = octave mode)
                 pitchRandMode = (float)v;
             }
             else if constexpr (P == 3)
             {
-                // Rand Vol
                 grainVolumeMin = 1.f - (float)v;
             }
             else if constexpr (P == 4)
             {
-                // Rand Pan
                 grainPanRange = (float)v;
             }
             else if constexpr (P == 5)
             {
-                // Grain Size (ms)
                 grainSizeMS = v;
                 updateDerivedParameters();
             }
             else if constexpr (P == 6)
             {
-                // Grain Interval (ms)
                 grainIntervalMS = v;
                 updateDerivedParameters();
             }
             else if constexpr (P == 7)
             {
-                // Rand Interval (sec)
                 grainGapAdjustmentMaxSec = v;
             }
             else if constexpr (P == 8)
             {
-                // Rand Size
                 grainSizeRandom = (float)v;
             }
             else if constexpr (P == 9)
             {
-                // Sample Start
                 grainStartPercent = (float)v;
                 updateDerivedParameters();
             }
             else if constexpr (P == 10)
             {
-                // Scan End
                 scanEndPercent = (float)v;
             }
             else if constexpr (P == 11)
             {
-                // Scan Time (sec)
                 startModTimeSec = v;
             }
             else if constexpr (P == 12)
             {
-                // Scan Enable
                 startModEnabled = (v >= 0.5);
             }
             else if constexpr (P == 13)
             {
-                // Spray
                 grainSpray = (float)v;
             }
             else if constexpr (P == 14)
             {
-                // Spray Mode
                 grainSprayMode = (v >= 0.5) ? 1.f : 0.f;
             }
             else if constexpr (P == 15)
             {
-                // Punchy Mode
                 bool oldPunchy = punchyMode;
                 punchyMode = (v >= 0.5);
                 if (oldPunchy != punchyMode)
@@ -1507,9 +1420,13 @@ namespace project
             }
             else if constexpr (P == 16)
             {
-                // Envelope Type
                 envelopeType = (int)std::round(v * 2.0f);
                 updateEnvelopeFunctions();
+            }
+            else if constexpr (P == 17)
+            {
+                // Reverse Chance parameter.
+                reverseChance = (float)v;
             }
         }
 
@@ -1616,6 +1533,12 @@ namespace project
                 registerCallback<16>(envTypeParam);
                 envTypeParam.setDefaultValue(0.0);
                 data.add(std::move(envTypeParam));
+            }
+            {
+                parameter::data reverseChanceParam("Reverse Chance", { 0.0, 1.0, 0.01 });
+                registerCallback<17>(reverseChanceParam);
+                reverseChanceParam.setDefaultValue(0.0);
+                data.add(std::move(reverseChanceParam));
             }
         }
 
