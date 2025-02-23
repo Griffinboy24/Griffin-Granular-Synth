@@ -1,0 +1,211 @@
+#pragma once
+
+#include <cmath>
+#include <vector>
+#include <array>
+#include <tuple>
+#include <JuceHeader.h>
+
+namespace project
+{
+
+	namespace globals {
+		const int MAX_PARTIALS = 64;
+	}
+
+	// Partial is a second-order bandpass filter
+	class Partial
+	{
+	public:
+		Partial(int n) { k = n; };
+		~Partial() {};
+
+		void update(double freq, double ratio, double ratio_max, double vel, bool isRelease);
+		double process(double input);
+		void clear();
+
+		double srate = 0.0;
+		int k = 0;
+		double decay = 0.0;
+		double damp = 0.0;
+
+	private:
+		double b0 = 0.0;
+		double b2 = 0.0;
+		double a0 = 1.0;
+		double a1 = 0.0;
+		double a2 = 0.0;
+
+		double x1 = 0.0;
+		double x2 = 0.0;
+		double y1 = 0.0;
+		double y2 = 0.0;
+	};
+
+	void Partial::update(double f_0, double ratio, double ratio_max, double vel, bool isRelease)
+	{
+		auto f_k = f_0 * ratio * k;
+
+		double decay_k = std::pow(decay, 2.0);
+		if (decay_k <= 0.0) decay_k = 0.0001;
+
+		if (f_k >= 0.48 * srate || f_k < 20.0) {
+			b0 = b2 = a1 = a2 = 0.0;
+			a0 = 1.0;
+			return;
+		}
+
+		auto omega = juce::MathConstants<double>::twoPi * f_k / srate;
+		auto alpha = juce::MathConstants<double>::twoPi / srate;
+
+		auto damp_k = 1.0 + (damp * 2.0);
+		decay_k /= damp_k;
+
+		auto amp_k = 1.0;
+
+		b0 = alpha * amp_k;
+		b2 = -alpha * amp_k;
+		a0 = 1.0 + alpha / decay_k;
+		a1 = -2.0 * cos(omega);
+		a2 = 1.0 - alpha / decay_k;
+	}
+
+	double Partial::process(double input)
+	{
+		auto output = ((b0 * input + b2 * x2) - (a1 * y1 + a2 * y2)) / a0;
+		x2 = x1;
+		x1 = input;
+		y2 = y1;
+		y1 = output;
+
+		return output;
+	}
+
+	void Partial::clear()
+	{
+		x1 = x2 = y1 = y2 = 0;
+	}
+
+	enum Models {
+		Beam // Keeping Beam label for full compatibility
+	};
+
+	class Resonator
+	{
+	public:
+		Resonator();
+		~Resonator() {};
+
+		void setParams(double srate, bool on, int model, int partials, double decay, double damp, double tone, double hit,
+			double rel, double inharm, double cut, double radius, double vel_decay, double vel_hit, double vel_inharm);
+
+		void update(double frequency, double vel, bool isRelease, std::array<double, 64> _model);
+		void clear();
+		double process(double x);
+
+		double srate = 0.0;
+		bool on = false;
+		int nmodel = 0;
+		int npartials = 0;
+		double decay = 0.0;
+		double damp = 0.0;
+
+		std::vector<Partial> partials;
+
+	private:
+
+	};
+
+	Resonator::Resonator()
+	{
+		for (int i = 0; i < globals::MAX_PARTIALS; ++i) {
+			partials.push_back(Partial(i + 1));
+		}
+	}
+
+	void Resonator::setParams(double _srate, bool _on, int model, int _partials, double _decay, double _damp, double tone, double hit,
+		double _rel, double inharm, double cut, double radius, double vel_decay, double vel_hit, double vel_inharm)
+	{
+		on = _on;
+		nmodel = Models::Beam;
+		npartials = _partials;
+		decay = _decay;
+		damp = _damp;
+		srate = _srate;
+
+		for (Partial& partial : partials) {
+			partial.damp = damp;
+			partial.decay = decay;
+			partial.srate = _srate;
+		}
+	}
+
+	void Resonator::update(double freq, double vel, bool isRelease, std::array<double, 64> model)
+	{
+		for (Partial& partial : partials) {
+			auto idx = partial.k - 1;
+			partial.update(freq, model[idx], model[model.size() - 1], vel, isRelease);
+		}
+	}
+
+	double Resonator::process(double input)
+	{
+		double out = 0.0;
+
+		for (int p = 0; p < npartials; ++p) {
+			out += partials[p].process(input);
+		}
+
+		return out;
+	}
+
+	void Resonator::clear()
+	{
+		for (Partial& partial : partials) {
+			partial.clear();
+		}
+	}
+
+	class Voice
+	{
+	public:
+		Voice() {};
+		~Voice() {};
+
+		static std::array<double, 64> bFree;
+		static std::array<std::array<double, 64>, 1> aModels;
+
+		static void recalcBeam(bool resA, double ratio);
+
+		Resonator resA{};
+
+	private:
+	};
+
+	std::array<double, 64> Voice::bFree = {
+		1.0, 2.05, 3.16, 3.8, 4.52, 5.32, 6.12, 7.09,
+		7.5, 8.6, 9.3, 9.98, 10.6, 11.2, 12.0, 12.7,
+		13.4, 14.1, 14.8, 15.5, 16.2, 16.9, 17.6, 18.3,
+		19.0, 19.7, 20.4, 21.1, 21.8, 22.5, 23.2, 23.9,
+		24.6, 25.3, 26.0, 26.7, 27.4, 28.1, 28.8, 29.5,
+		30.2, 30.9, 31.6, 32.3, 33.0, 33.7, 34.4, 35.1,
+		35.8, 36.5, 37.2, 37.9, 38.6, 39.3, 40.0, 40.7,
+		41.4, 42.1, 42.8, 43.5, 44.2, 44.9, 45.6, 46.3
+	};
+
+	std::array<std::array<double, 64>, 1> Voice::aModels = { { Voice::bFree } };
+
+	void Voice::recalcBeam(bool resA, double ratio)
+	{
+		std::array<double, 64>& model = aModels[Models::Beam];
+
+		for (int i = 0; i < 64; ++i) {
+			model[i] = std::pow(bFree[i], 2.0);
+		}
+
+		double f0 = model[0];
+		for (int j = 0; j < 64; ++j) {
+			model[j] = model[j] / f0;
+		}
+	}
+}
