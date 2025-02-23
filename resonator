@@ -101,13 +101,12 @@ namespace project
 
 	void Partial::update(double f_0, double ratio, double ratio_max, double vel, bool isRelease)
 	{
-		// Beam model specific update, simplified parameters
-		auto f_k = f_0 * ratio * k; // Simplified harmonic frequency calculation for beam
+		auto f_k = f_0 * ratio * k;
 
-		double decay_k = decay; // Direct decay parameter
-		if (decay_k <= 0.0) decay_k = 0.0001; // Avoid zero decay
+		double decay_k = std::pow(decay, 2.0); // Exponential scaling for better effect
+		if (decay_k <= 0.0) decay_k = 0.0001;
 
-		if (f_k >= 0.48 * srate || f_k < 20.0) { // Basic frequency limits
+		if (f_k >= 0.48 * srate || f_k < 20.0) {
 			b0 = b2 = a1 = a2 = 0.0;
 			a0 = 1.0;
 			return;
@@ -116,19 +115,18 @@ namespace project
 		auto omega = juce::MathConstants<double>::twoPi * f_k / srate;
 		auto alpha = juce::MathConstants<double>::twoPi / srate;
 
-		auto damp_k = damp; // Direct damp parameter
+		auto damp_k = 1.0 + (damp * 2.0); // Increase damping effect
+		decay_k /= damp_k;
 
-		decay_k /= damp_k > 0.0 ? damp_k : 1.0; // Damping factor on decay, avoid div by zero
+		auto amp_k = 1.0;
 
-		auto amp_k = 1.0; // Constant amplitude for all partials, can be modified
-
-		// Bandpass filter coefficients (normalized)
 		b0 = alpha * amp_k;
 		b2 = -alpha * amp_k;
 		a0 = 1.0 + alpha / decay_k;
 		a1 = -2.0 * cos(omega);
 		a2 = 1.0 - alpha / decay_k;
 	}
+
 
 	double Partial::process(double input)
 	{
