@@ -1,0 +1,285 @@
+
+#pragma once
+
+#include <cmath>
+#include <vector>
+#include <array>
+#include <tuple>
+#include <JuceHeader.h>
+
+namespace project
+{
+
+	namespace globals {
+		const int MAX_PARTIALS = 64;
+	}
+
+	// Dummy Filter (Not used in this simplified beam resonator)
+	class Filter {
+	public:
+		Filter() {}
+		~Filter() {}
+		void hp(double srate, double cut, double resonance) {}
+	private:
+	};
+
+	// Dummy Waveguide (Not used in beam resonator)
+	class Waveguide {
+	public:
+		Waveguide() {}
+		~Waveguide() {}
+		double process(double input) { return 0.0; }
+		void update(double freq, double vel, bool isRelease) {}
+		void clear() {}
+
+		double decay = 0.0;
+		double radius = 0.0;
+		bool is_closed = false;
+		double srate = 0.0;
+		double vel_decay = 0.0;
+		double rel = 0.0;
+	};
+
+	// Dummy Mallet (Not used in audio-driven effect)
+	class Mallet {
+	public:
+		Mallet() {}
+		~Mallet() {}
+		void trigger(double srate, double malletFreq) {}
+		void clear() {}
+	private:
+	};
+
+	// Dummy Noise (Not used in audio-driven effect)
+	class Noise {
+	public:
+		Noise() {}
+		~Noise() {}
+		void attack(double amp) {}
+		void release() {}
+		void clear() {}
+	private:
+	};
+
+
+	// Partial is a second order bandpass filter
+	class Partial
+	{
+	public:
+		Partial(int n) { k = n; };
+		~Partial() {};
+
+		void update(double freq, double ratio, double ratio_max, double vel, bool isRelease);
+		double process(double input);
+		void clear();
+
+		double srate = 0.0;
+		int k = 0; // Partial num
+		double decay = 0.0;
+		double damp = 0.0;
+		double tone = 0.0; // Not used in this version, can be removed or repurposed
+		double hit = 0.0;  // Not used in this version, can be removed or repurposed
+		double rel = 0.0; // Not used in this version, can be removed or repurposed
+		double inharm = 0.0; // Not used in this version, can be removed or repurposed
+		double radius = 0.0; // Not used in this version, can be removed or repurposed
+		double vel_decay = 0.0; // Not used in this version, can be removed or repurposed
+		double vel_hit = 0.0;  // Not used in this version, can be removed or repurposed
+		double vel_inharm = 0.0; // Not used in this version, can be removed or repurposed
+
+	private:
+		double b0 = 0.0;
+		double b2 = 0.0;
+		double a0 = 1.0;
+		double a1 = 0.0;
+		double a2 = 0.0;
+
+		double x1 = 0.0;
+		double x2 = 0.0;
+		double y1 = 0.0;
+		double y2 = 0.0;
+	};
+
+	void Partial::update(double f_0, double ratio, double ratio_max, double vel, bool isRelease)
+	{
+		// Beam model specific update, simplified parameters
+		auto f_k = f_0 * ratio * k; // Simplified harmonic frequency calculation for beam
+
+		double decay_k = decay; // Direct decay parameter
+		if (decay_k <= 0.0) decay_k = 0.0001; // Avoid zero decay
+
+		if (f_k >= 0.48 * srate || f_k < 20.0) { // Basic frequency limits
+			b0 = b2 = a1 = a2 = 0.0;
+			a0 = 1.0;
+			return;
+		}
+
+		auto omega = juce::MathConstants<double>::twoPi * f_k / srate;
+		auto alpha = juce::MathConstants<double>::twoPi / srate;
+
+		auto damp_k = damp; // Direct damp parameter
+
+		decay_k /= damp_k > 0.0 ? damp_k : 1.0; // Damping factor on decay, avoid div by zero
+
+		auto amp_k = 1.0; // Constant amplitude for all partials, can be modified
+
+		// Bandpass filter coefficients (normalized)
+		b0 = alpha * amp_k;
+		b2 = -alpha * amp_k;
+		a0 = 1.0 + alpha / decay_k;
+		a1 = -2.0 * cos(omega);
+		a2 = 1.0 - alpha / decay_k;
+	}
+
+	double Partial::process(double input)
+	{
+		auto output = ((b0 * input + b2 * x2) - (a1 * y1 + a2 * y2)) / a0;
+		x2 = x1;
+		x1 = input;
+		y2 = y1;
+		y1 = output;
+
+		return output;
+	}
+
+	void Partial::clear()
+	{
+		x1 = x2 = y1 = y2 = 0;
+	}
+
+
+	enum Models {
+		Beam // Only Beam model is used
+	};
+
+	class Resonator
+	{
+	public:
+		Resonator();
+		~Resonator() {};
+
+		void setParams(double srate, bool on, int model, int partials, double decay, double damp, double tone, double hit,
+			double rel, double inharm, double cut, double radius, double vel_decay, double vel_hit, double vel_inharm);
+
+		void update(double frequency, double vel, bool isRelease, std::array<double, 64> _model);
+		void clear();
+		double process(double x);
+
+		double srate = 0.0;
+		bool on = false;
+		int nmodel = 0; // Fixed to Beam model
+		int npartials = 0;
+		double decay = 0.0;
+		double damp = 0.0;
+
+
+		std::vector<Partial> partials;
+		// No Waveguide or Filter needed for simplified beam resonator
+
+	private:
+
+	};
+
+	Resonator::Resonator()
+	{
+		for (int i = 0; i < globals::MAX_PARTIALS; ++i) {
+			partials.push_back(Partial(i + 1));
+		}
+	}
+
+	void Resonator::setParams(double _srate, bool _on, int model, int _partials, double _decay, double _damp, double tone, double hit,
+		double _rel, double inharm, double cut, double radius, double vel_decay, double vel_hit, double vel_inharm)
+	{
+		on = _on;
+		nmodel = Models::Beam; // Fixed to Beam model
+		npartials = _partials;
+		decay = _decay;
+		damp = _damp;
+		srate = _srate;
+
+		for (Partial& partial : partials) {
+			partial.damp = damp;
+			partial.decay = decay;
+			partial.srate = _srate;
+		}
+	}
+
+	void Resonator::update(double freq, double vel, bool isRelease, std::array<double, 64> model)
+	{
+		for (Partial& partial : partials) {
+			auto idx = partial.k - 1;
+			partial.update(freq, model[idx], model[model.size() - 1], vel, isRelease);
+		}
+	}
+
+
+	double Resonator::process(double input)
+	{
+		double out = 0.0;
+
+		for (int p = 0; p < npartials; ++p) {
+			out += partials[p].process(input);
+		}
+
+		return out;
+	}
+
+	void Resonator::clear()
+	{
+		for (Partial& partial : partials) {
+			partial.clear();
+		}
+	}
+
+
+	class Voice
+	{
+	public:
+		Voice() {};
+		~Voice() {};
+
+		// static ratio models shared by voices, definition in .cpp
+		static std::array<double, 64> bFree;
+		static std::array<std::array<double, 64>, 1> aModels; // Only Beam Model needed now
+		static std::array<std::array<double, 64>, 1> bModels; // bModels not really needed for single resonator setup
+
+		// triggered on model ratio param changes
+		void static recalcBeam(bool resA, double ratio);
+
+
+		Resonator resA{}; // Only one resonator needed
+
+	private:
+	};
+
+
+	// Bfree[n] is the nth solution of cos($pi*x) = 1/cos($pi*x)
+	std::array<double, 64> Voice::bFree = { 1.50561873, 2.49975267, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5, 13.5, 14.5, 15.5, 16.5, 17.5, 18.5, 19.5, 20.5, 21.5, 22.5, 23.5, 24.5, 25.5, 26.5, 27.5, 28.5, 29.5, 30.5, 31.5, 32.5, 33.5, 34.5, 35.5, 36.5, 37.5, 38.5, 39.5, 40.5, 41.5, 42.5, 43.5, 44.5, 45.5, 46.5, 47.5, 48.5, 49.5, 50.5, 51.5, 52.5, 53.5, 54.5, 55.5, 56.5, 57.5, 58.5, 59.5, 60.5, 61.5, 62.5, 63.5, 64.5 };
+	// 1 Model of modal ratios shared by every voice, only Beam now
+	std::array<std::array<double, 64>, 1> Voice::aModels = { {
+			// beam model: fmn *= sqrt(m**4 + (2*Bfree[n])**4)
+			// where Bfree[n] is the nth solution of cos($pi*x) = 1/cos($pi*x)
+			// https://nathan.ho.name/posts/exploring-modal-synthesis
+			{ 1.0, 2.742118730723096, 5.372437705395023, 8.879796231350905, 13.26432297929055, 18.525894832548836, 24.664464701923304, 31.680011427264994, 39.57480167993186, 48.34386187557112, 57.98998201587341, 68.51312839987956, 79.91327932335997, 92.19042029669127, 105.34454134738507, 119.37563542989709, 134.286605658006, 150.07132597088105, 166.73305349293955, 184.27177735520195, 202.68748915580662, 221.9801823173097, 242.14985163115497, 263.1964929295172, 285.1237904740257, 307.92409320904443, 331.6013888047332, 356.1556713642617, 381.58693597293706, 407.89517850825996, 435.08039549149447, 463.1425839706985, 492.0862467609114, 521.9021136490643, 552.5949669402571, 584.164802709515, 616.6116175480827, 649.9354084840451, 684.1361729168341, 719.2139085629082, 755.1739518807949, 792.0053758900387, 829.7137826702212, 868.2991693165571, 907.7615332399005, 948.1008721264657, 989.3171839034187, 1031.4104667093834, 1074.3868982163283, 1118.233875919467, 1162.9578340759736, 1208.5587703942417, 1255.0366827948008, 1302.3915693871795, 1350.6234284496627, 1399.7322584115318, 1449.7250824905104, 1500.5876119645127, 1552.3271202881517, 1604.9436055754263, 1658.4370660924033, 1712.8075002427393, 1768.0549065547818, 1824.179283670064 }
+		} };
+	std::array<std::array<double, 64>, 1> Voice::bModels = Voice::aModels; // bModels not needed, keeping it same as aModels for simplicity
+
+
+	void Voice::recalcBeam(bool resA, double ratio)
+	{
+		std::array<double, 64>& model = aModels[Models::Beam]; // Fixed to aModels and Beam model
+
+		int i = 0;
+		for (int m = 1; m <= 8; ++m) {
+			for (int n = 1; n <= 8; ++n) {
+				model[i] = sqrt(pow(m, 4.0) + pow(ratio * bFree[i], 4.0));
+				i += 1;
+			}
+		}
+		auto f0 = model[0];
+		for (int j = 0; j < 64; ++j) {
+			model[j] = model[j] / f0; // freqs to ratio
+		}
+	}
+
+
+}
