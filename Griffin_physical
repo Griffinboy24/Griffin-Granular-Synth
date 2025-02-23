@@ -1,12 +1,10 @@
-
 #pragma once
 #include <JuceHeader.h>
 
 #include <array>
 #include <cmath>
 
-#include "src\resonator.h" // Changed include path to be relative to the project, assuming resonator.h is in the same directory or a subdirectory
-
+#include "src\resonator.h" // Include relative to project structure
 
 namespace project
 {
@@ -15,11 +13,9 @@ namespace project
 #define M_PI 3.14159265358979323846
 #endif
 
-
     using namespace juce;
     using namespace hise;
     using namespace scriptnode;
-
 
     namespace FunctionsClasses {
 
@@ -27,29 +23,28 @@ namespace project
 
     }
 
-
-
-
     template <int NV>
-    // name
-    struct Griffin_Physical : public data::base // Keeping original name for framework compatibility
-    {          // name
-        SNEX_NODE(Griffin_Physical); // Keeping original name for framework compatibility
+    struct Griffin_Physical : public data::base
+    {
+        SNEX_NODE(Griffin_Physical);
 
         struct MetadataClass
-        {              // name
-            SN_NODE_ID("Griffin_Physical"); // Keeping original name for framework compatibility
+        {
+            SN_NODE_ID("Griffin_Physical");
         };
 
-        //==============================================================================
-        // Node Properties
-        //==============================================================================
+        // Needed by compiler
+        void handleHiseEvent(HiseEvent& e)
+        {
+        }
+        template <typename FrameDataType>
+        void processFrame(FrameDataType&) {}
 
         static constexpr bool isModNode() { return false; }
-        static constexpr bool isPolyphonic() { return false; } // Beam effect is not polyphonic in this context
-        static constexpr bool hasTail() { return true; } // Could have a tail depending on decay
+        static constexpr bool isPolyphonic() { return false; }
+        static constexpr bool hasTail() { return true; }
         static constexpr bool isSuspendedOnSilence() { return false; }
-        static constexpr int getFixChannelAmount() { return 2; } // Stereo output
+        static constexpr int getFixChannelAmount() { return 2; }
 
         static constexpr int NumTables = 0;
         static constexpr int NumSliderPacks = 0;
@@ -57,67 +52,53 @@ namespace project
         static constexpr int NumFilters = 0;
         static constexpr int NumDisplayBuffers = 0;
 
-        //==============================================================================
-        // Audio Effect Class (Modify this to implement your specific audio effect)
-        //==============================================================================
-
         class AudioEffect
         {
         public:
             AudioEffect()
             {
-                // Initialize with default parameters if needed
             }
 
-            // Initialize the effect if needed
             void prepare(double sampleRate)
             {
-                voice.resA.setParams(sampleRate, true, project::Models::Beam, 64, 0.5, 0.5, 0.0, 0.5, 0.5, 0.1, 20000.0, 0.1, 0.0, 0.0, 0.0); // Example default params
+                voice.resA.setParams(sampleRate, true, project::Models::Beam, 64, 0.5, 0.5, 0.0, 0.5, 0.5, 0.1, 20000.0, 0.1, 0.0, 0.0, 0.0);
             }
 
-            // Process a block of samples
             void process(float* samples, int numSamples)
             {
                 for (int i = 0; i < numSamples; ++i)
                 {
-                    samples[i] = voice.resA.process(samples[i]); // Process each sample through the beam resonator
+                    samples[i] = voice.resA.process(samples[i]);
                 }
             }
 
-            // Update the parameters
-            void updateParams(float fundamentalFreq, float ratio, float decay, float damp) // Corrected function signature to take 4 arguments
+            void updateParams(float fundamentalFreq, float ratio, float decay, float damp)
             {
                 voice.resA.decay = decay;
                 voice.resA.damp = damp;
-                project::Voice::recalcBeam(true, ratio); // Recalculate beam model based on ratio
-                voice.resA.update(fundamentalFreq, 1.0, false, project::Voice::aModels[project::Models::Beam]); // Update resonator with new params, velocity is dummy 1.0, not release
 
+                // Ensure parameters are propagated
+                voice.resA.setParams(voice.resA.srate, true, project::Models::Beam, 64, decay, damp, 0.0, 0.0, 0.0, 0.0, 20000.0, 0.1, 0.0, 0.0, 0.0);
+
+                project::Voice::recalcBeam(true, ratio);
+                voice.resA.update(fundamentalFreq, 1.0, false, project::Voice::aModels[project::Models::Beam]);
             }
 
-
         private:
-            project::Voice voice; // Use the Voice class to manage the beam resonator
+            project::Voice voice;
         };
 
-        //==============================================================================
-        // Main Processing Functions
-        //==============================================================================
-
-        // Initialize the effect
         void prepare(PrepareSpecs specs)
         {
             float sampleRate = specs.sampleRate;
             float numChannels = specs.numChannels;
 
-            // Initialize both effects (for stereo processing)
             leftChannelEffect.prepare(sampleRate);
             rightChannelEffect.prepare(sampleRate);
         }
 
-        // Reset (called when the plugin is reloaded)
         void reset() {}
 
-        // Process audio blocks (audio enters the node here)
         template <typename ProcessDataType>
         void process(ProcessDataType& data)
         {
@@ -129,107 +110,59 @@ namespace project
 
             float blockSize = data.getNumSamples();
 
-            // Process each channel separately (can be the same effect instance for mono->stereo beam)
             leftChannelEffect.process(leftChannelData, blockSize);
             rightChannelEffect.process(rightChannelData, blockSize);
         }
 
-        //==============================================================================
-        // Parameter Handling
-        //==============================================================================
-
-        // Update parameters
         template <int P>
         void setParameter(double v)
         {
             if (P == 0) {
                 fundamentalFreqParam = static_cast<float>(v);
-                leftChannelEffect.updateParams(fundamentalFreqParam, ratioParam, decayParam, dampParam); // Correct call with 4 arguments
-                rightChannelEffect.updateParams(fundamentalFreqParam, ratioParam, decayParam, dampParam); // Correct call with 4 arguments
             }
             else if (P == 1) {
                 ratioParam = static_cast<float>(v);
-                leftChannelEffect.updateParams(fundamentalFreqParam, ratioParam, decayParam, dampParam); // Correct call with 4 arguments
-                rightChannelEffect.updateParams(fundamentalFreqParam, ratioParam, decayParam, dampParam); // Correct call with 4 arguments
             }
             else if (P == 2) {
                 decayParam = static_cast<float>(v);
-                leftChannelEffect.updateParams(fundamentalFreqParam, ratioParam, decayParam, dampParam); // Correct call with 4 arguments
-                rightChannelEffect.updateParams(fundamentalFreqParam, ratioParam, decayParam, dampParam); // Correct call with 4 arguments
             }
             else if (P == 3) {
                 dampParam = static_cast<float>(v);
-                leftChannelEffect.updateParams(fundamentalFreqParam, ratioParam, decayParam, dampParam); // Correct call with 4 arguments
-                rightChannelEffect.updateParams(fundamentalFreqParam, ratioParam, decayParam, dampParam); // Correct call with 4 arguments
             }
 
+            leftChannelEffect.updateParams(fundamentalFreqParam, ratioParam, decayParam, dampParam);
+            rightChannelEffect.updateParams(fundamentalFreqParam, ratioParam, decayParam, dampParam);
         }
 
-        // Create GUI parameters
         void createParameters(ParameterDataList& data)
         {
-            {
-                parameter::data p("Fundamental Freq", { 20.0, 20000.0, 0.1 });
-                registerCallback<0>(p);
-                p.setDefaultValue(200.0);
-                data.add(std::move(p));
-            }
-            {
-                parameter::data p("Ratio", { 0.1, 10.0, 0.01 });
-                registerCallback<1>(p);
-                p.setDefaultValue(1.0);
-                data.add(std::move(p));
-            }
-            {
-                parameter::data p("Decay", { 0.01, 100.0, 0.01 });
-                registerCallback<2>(p);
-                p.setDefaultValue(0.5);
-                data.add(std::move(p));
-            }
-            {
-                parameter::data p("Damping", { 0.0, 1.0, 0.01 });
-                registerCallback<3>(p);
-                p.setDefaultValue(0.5);
-                data.add(std::move(p));
-            }
+            parameter::data p("Fundamental Freq", { 20.0, 10000.0, 0.1 });
+            registerCallback<0>(p);
+            p.setDefaultValue(500.0);
+            data.add(std::move(p));
 
+            parameter::data p2("Ratio", { 0.1, 2.0, 0.01 });
+            registerCallback<1>(p2);
+            p2.setDefaultValue(1.0);
+            data.add(std::move(p2));
+
+            parameter::data p3("Decay", { 0.01, 2.5, 0.01 });
+            registerCallback<2>(p3);
+            p3.setDefaultValue(1.5);
+            data.add(std::move(p3));
+
+            parameter::data p4("Damping", { 0.0, 1.0, 0.01 });
+            registerCallback<3>(p4);
+            p4.setDefaultValue(0.6);
+            data.add(std::move(p4));
         }
-
-        //==============================================================================
-        // External Data Handling - Not used for this audio effect
-        //==============================================================================
-
-        void setExternalData(const ExternalData& ed, int index)
-        {
-        }
-
-        //==============================================================================
-        // Event Handling - No MIDI events in this audio effect
-        //==============================================================================
-
-        void handleHiseEvent(HiseEvent& e)
-        {
-        }
-
-        //==============================================================================
-        // Modulation Output - Not used in this audio effect
-        //==============================================================================
-
-
-        //==============================================================================
-        // Frame Processing (Required by compiler, but not used in block processing)
-        //==============================================================================
-
-        template <typename FrameDataType>
-        void processFrame(FrameDataType& data) {}
 
     private:
         AudioEffect leftChannelEffect;
         AudioEffect rightChannelEffect;
-        float fundamentalFreqParam = 200.0f; // Default fundamental frequency
-        float ratioParam = 1.0f; // Default ratio
-        float decayParam = 0.5f; // Default decay
-        float dampParam = 0.5f; // Default damping
-
+        float fundamentalFreqParam = 200.0f;
+        float ratioParam = 1.0f;
+        float decayParam = 0.5f;
+        float dampParam = 0.5f;
     };
 }
