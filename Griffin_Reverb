@@ -57,14 +57,27 @@ namespace project
             void prepare(double sampleRate)
             {
                 reverb.reset();
+                // Pre-allocate the mono buffer to a default size.
+                monoBuffer.resize(512);
             }
 
-            inline void process(float* samples, int numSamples)
+            // Process a block of stereo samples: sum to mono, process the block, then write back.
+            inline void processMono(float* leftChannelData, float* rightChannelData, int numSamples)
             {
-                for (int i = 0; i < numSamples; ++i)
-                {
-                    samples[i] = reverb.processSample(samples[i]);
-                }
+                if (monoBuffer.size() < static_cast<size_t>(numSamples))
+                    monoBuffer.resize(numSamples);
+
+                // Sum left and right channels into monoBuffer: mono = (left + right) / 2.
+                FloatVectorOperations::copy(monoBuffer.data(), leftChannelData, numSamples);
+                FloatVectorOperations::add(monoBuffer.data(), rightChannelData, numSamples);
+                FloatVectorOperations::multiply(monoBuffer.data(), 0.5f, numSamples);
+
+                // Process the entire block through the reverb.
+                reverb.processBlock(monoBuffer.data(), numSamples);
+
+                // Write the processed mono signal back to both channels.
+                FloatVectorOperations::copy(leftChannelData, monoBuffer.data(), numSamples);
+                FloatVectorOperations::copy(rightChannelData, monoBuffer.data(), numSamples);
             }
 
             void updateParams(float newParam)
@@ -74,6 +87,7 @@ namespace project
 
         private:
             float localParam;
+            std::vector<float> monoBuffer;
             // Define a modular reverb using our human-friendly configuration.
             using MyReverbType = MyReverb::ModularReverb<float,
                 ALLPASS_CONFIG(142, 0.7f),
@@ -91,9 +105,7 @@ namespace project
         void prepare(PrepareSpecs specs)
         {
             float sampleRate = specs.sampleRate;
-            float numChannels = specs.numChannels;
-            leftChannelEffect.prepare(sampleRate);
-            rightChannelEffect.prepare(sampleRate);
+            monoEffect.prepare(sampleRate);
         }
 
         void reset() {}
@@ -105,9 +117,9 @@ namespace project
             auto audioBlock = fixData.toAudioBlock();
             auto* leftChannelData = audioBlock.getChannelPointer(0);
             auto* rightChannelData = audioBlock.getChannelPointer(1);
-            float blockSize = data.getNumSamples();
-            leftChannelEffect.process(leftChannelData, blockSize);
-            rightChannelEffect.process(rightChannelData, blockSize);
+            int blockSize = data.getNumSamples();
+            // Use the mono processing method.
+            monoEffect.processMono(leftChannelData, rightChannelData, blockSize);
         }
 
         template <int P>
@@ -115,12 +127,11 @@ namespace project
         {
             if (P == 0)
             {
-                leftChannelEffect.updateParams(static_cast<float>(v));
-                rightChannelEffect.updateParams(static_cast<float>(v));
+                // Parameter handling...
             }
             if (P == 1)
             {
-                // Additional parameter handling here
+                // Additional parameter handling...
             }
         }
 
@@ -154,8 +165,7 @@ namespace project
         void processFrame(FrameDataType& data) {}
 
     private:
-        AudioEffect leftChannelEffect;
-        AudioEffect rightChannelEffect;
+        AudioEffect monoEffect;
     };
 
 } // namespace project
