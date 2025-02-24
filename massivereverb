@@ -1,0 +1,208 @@
+#pragma once
+
+#include <vector>
+#include <array>
+#include <cstddef>
+#include <algorithm>
+#include <JuceHeader.h>
+
+// xsimd is included in project namespace already
+
+namespace project
+{
+    namespace MyReverb
+    {
+        // AlignedVector ensures contiguous, SIMD–friendly memory layout.
+        template <typename T>
+        using AlignedVector = std::vector<T, xsimd::aligned_allocator<T, 32>>;
+
+        //------------------------------------------------------------------------------
+        // Scalar access policy (integer delay values only)
+        template <typename T, std::size_t DelayLength>
+        struct ScalarDelayLineAccessPolicy
+        {
+            static T read(const AlignedVector<T>& buffer, std::size_t writeIndex, std::size_t delayOffset)
+            {
+                std::size_t readIndex = (writeIndex + DelayLength - delayOffset) % DelayLength;
+                return buffer[readIndex];
+            }
+            static void write(AlignedVector<T>& buffer, std::size_t writeIndex, T sample)
+            {
+                buffer[writeIndex] = sample;
+            }
+        };
+
+        //------------------------------------------------------------------------------
+        // Linear interpolated access policy (supports fractional delay values)
+        template <typename T, std::size_t DelayLength>
+        struct LinearInterpolatedDelayLineAccessPolicy
+        {
+            static T read(const AlignedVector<T>& buffer, std::size_t writeIndex, T delayInSamples)
+            {
+                int intDelay = static_cast<int>(delayInSamples);
+                T frac = delayInSamples - static_cast<T>(intDelay);
+                std::size_t index0 = (writeIndex + DelayLength - static_cast<std::size_t>(intDelay)) % DelayLength;
+                std::size_t index1 = (index0 + 1) % DelayLength;
+                T sample0 = buffer[index0];
+                T sample1 = buffer[index1];
+                return sample0 + frac * (sample1 - sample0);
+            }
+            static void write(AlignedVector<T>& buffer, std::size_t writeIndex, T sample)
+            {
+                buffer[writeIndex] = sample;
+            }
+        };
+
+        //------------------------------------------------------------------------------
+        // Policy-based DelayLine class
+        template <typename T, std::size_t DelayLength,
+            typename AccessPolicy = ScalarDelayLineAccessPolicy<T, DelayLength>>
+            class DelayLine
+        {
+        public:
+            DelayLine() : buffer(DelayLength, T(0)), writeIndex(0) {}
+            T read(std::size_t delayOffset) const { return AccessPolicy::read(buffer, writeIndex, delayOffset); }
+            T readFractional(T delayInSamples) const { return AccessPolicy::read(buffer, writeIndex, delayInSamples); }
+            void write(T sample) { AccessPolicy::write(buffer, writeIndex, sample); advance(); }
+            void reset() { std::fill(buffer.begin(), buffer.end(), T(0)); writeIndex = 0; }
+        private:
+            void advance() { writeIndex = (writeIndex + 1) % DelayLength; }
+            AlignedVector<T> buffer;
+            std::size_t writeIndex;
+        };
+
+        //------------------------------------------------------------------------------
+        // Templatized Allpass Filter
+        template <typename T, std::size_t DelayLength,
+            typename AccessPolicy = ScalarDelayLineAccessPolicy<T, DelayLength>>
+            class AllpassFilter
+        {
+        public:
+            explicit AllpassFilter(T gainValue) : gain(gainValue) {}
+            inline T processSample(T input)
+            {
+                T delayedSample = delayLine.read(DelayLength);
+                T output = -gain * input + delayedSample;
+                T newDelaySample = input + gain * output;
+                delayLine.write(newDelaySample);
+                return output;
+            }
+            inline void reset() { delayLine.reset(); }
+            inline T getGain() const { return gain; }
+            inline void setGain(T newGain) { gain = newGain; }
+        private:
+            T gain;
+            DelayLine<T, DelayLength, AccessPolicy> delayLine;
+        };
+
+        //------------------------------------------------------------------------------
+        // Series Network of Allpass Filters (Reverb Architecture)
+        template <typename T, std::size_t DelayLength, std::size_t NumFilters,
+            typename AccessPolicy = ScalarDelayLineAccessPolicy<T, DelayLength>>
+            class SeriesAllpassReverb
+        {
+        public:
+            explicit SeriesAllpassReverb(T gainValue)
+            {
+                for (auto& filter : filters)
+                    filter = AllpassFilter<T, DelayLength, AccessPolicy>(gainValue);
+            }
+            inline T processSample(T input)
+            {
+                T output = input;
+                for (auto& filter : filters)
+                    output = filter.processSample(output);
+                return output;
+            }
+            inline void reset()
+            {
+                for (auto& filter : filters)
+                    filter.reset();
+            }
+        private:
+            std::array<AllpassFilter<T, DelayLength, AccessPolicy>, NumFilters> filters;
+        };
+
+        //------------------------------------------------------------------------------
+        // Multi-Series Allpass Reverb with individual parameters.
+        template <typename T,
+            std::size_t DelayLength0,
+            std::size_t DelayLength1,
+            std::size_t DelayLength2,
+            std::size_t DelayLength3,
+            std::size_t DelayLength4,
+            typename AccessPolicy0 = ScalarDelayLineAccessPolicy<T, DelayLength0>,
+            typename AccessPolicy1 = ScalarDelayLineAccessPolicy<T, DelayLength1>,
+            typename AccessPolicy2 = ScalarDelayLineAccessPolicy<T, DelayLength2>,
+            typename AccessPolicy3 = ScalarDelayLineAccessPolicy<T, DelayLength3>,
+            typename AccessPolicy4 = ScalarDelayLineAccessPolicy<T, DelayLength4>>
+            class MultiSeriesAllpassReverb
+        {
+        public:
+            MultiSeriesAllpassReverb(T g0, T g1, T g2, T g3, T g4)
+                : filter0(g0), filter1(g1), filter2(g2), filter3(g3), filter4(g4)
+            {
+            }
+            inline T processSample(T input)
+            {
+                T out = filter0.processSample(input);
+                out = filter1.processSample(out);
+                out = filter2.processSample(out);
+                out = filter3.processSample(out);
+                out = filter4.processSample(out);
+                return out;
+            }
+            inline void reset()
+            {
+                filter0.reset();
+                filter1.reset();
+                filter2.reset();
+                filter3.reset();
+                filter4.reset();
+            }
+        private:
+            AllpassFilter<T, DelayLength0, AccessPolicy0> filter0;
+            AllpassFilter<T, DelayLength1, AccessPolicy1> filter1;
+            AllpassFilter<T, DelayLength2, AccessPolicy2> filter2;
+            AllpassFilter<T, DelayLength3, AccessPolicy3> filter3;
+            AllpassFilter<T, DelayLength4, AccessPolicy4> filter4;
+        };
+
+        //------------------------------------------------------------------------------
+        // Modular Reverb Creator
+        //
+        // Note: To avoid floating-point non-type template parameters pre-C++20, gains are specified as integer thousandths.
+        // For example, a gain of 0.7 is represented as 700.
+        template <std::size_t DelayLength, int Gain1000>
+        struct AllpassConfig
+        {
+            static constexpr std::size_t delayLength = DelayLength;
+            static constexpr float gain = static_cast<float>(Gain1000) / 1000.0f;
+        };
+
+        // Macro to simplify AllpassConfig creation.
+        // Fully qualifies the type to ensure proper lookup.
+#define ALLPASS_CONFIG(delay, gain) project::MyReverb::AllpassConfig<delay, (int)((gain)*1000)>
+
+// ModularReverb: a compile-time configurable series reverb built from a variadic list of AllpassConfig types.
+        template <typename T, typename... Configs>
+        class ModularReverb
+        {
+        public:
+            ModularReverb() : filters{ AllpassFilter<T, Configs::delayLength>(Configs::gain)... } {}
+            inline T processSample(T input)
+            {
+                T out = input;
+                std::apply([&](auto&... filter) { ((out = filter.processSample(out)), ...); }, filters);
+                return out;
+            }
+            inline void reset()
+            {
+                std::apply([](auto&... filter) { (filter.reset(), ...); }, filters);
+            }
+        private:
+            std::tuple<AllpassFilter<T, Configs::delayLength>...> filters;
+        };
+
+    } // namespace MyReverb
+} // namespace project
