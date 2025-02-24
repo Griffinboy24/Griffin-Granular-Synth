@@ -1,6 +1,6 @@
 #pragma once
 #include <JuceHeader.h>
-#include "src\massivereverb.h" // Include relative to project structure
+#include "src/massivereverb.h" // Include relative to project structure
 
 namespace project
 {
@@ -54,28 +54,23 @@ namespace project
             {
             }
 
-            void prepare(double sampleRate)
+            void prepare(double sampleRate, double blockSize)
             {
                 reverb.reset();
+                // Update LFO modulators and modulated filters with the current sample rate.
+                reverb.setLfoSampleRate(static_cast<float>(sampleRate));
                 // Pre-allocate the mono buffer to a default size.
-                monoBuffer.resize(512);
+                monoBuffer.resize(blockSize);
             }
 
-            // Process a block of stereo samples: sum to mono, process the block, then write back.
             inline void processMono(float* leftChannelData, float* rightChannelData, int numSamples)
             {
                 if (monoBuffer.size() < static_cast<size_t>(numSamples))
                     monoBuffer.resize(numSamples);
-
-                // Sum left and right channels into monoBuffer: mono = (left + right) / 2.
                 FloatVectorOperations::copy(monoBuffer.data(), leftChannelData, numSamples);
                 FloatVectorOperations::add(monoBuffer.data(), rightChannelData, numSamples);
                 FloatVectorOperations::multiply(monoBuffer.data(), 0.5f, numSamples);
-
-                // Process the entire block through the reverb.
                 reverb.processBlock(monoBuffer.data(), numSamples);
-
-                // Write the processed mono signal back to both channels.
                 FloatVectorOperations::copy(leftChannelData, monoBuffer.data(), numSamples);
                 FloatVectorOperations::copy(rightChannelData, monoBuffer.data(), numSamples);
             }
@@ -88,24 +83,20 @@ namespace project
         private:
             float localParam;
             std::vector<float> monoBuffer;
-            // Define a modular reverb using our human-friendly configuration.
+            // Our reverb now uses a single modulated allpass filter.
             using MyReverbType = MyReverb::ModularReverb<float,
-                ALLPASS_CONFIG(142, 0.7f),
-                ALLPASS_CONFIG(107, 0.65f),
-                ALLPASS_CONFIG(379, 0.6f),
-                ALLPASS_CONFIG(277, 0.55f),
-                ALLPASS_CONFIG(421, 0.5f)
+                // Uncomment and add more configurations if needed.
+                // ALLPASS_CONFIG(277, 0.55f),
+                ALLPASS_MOD_CONFIG(500, 0.55f, 0.9128f, 0.0001f)
             >;
             MyReverbType reverb;
         };
 
-        //==============================================================================
-        // Main Processing Functions
-        //==============================================================================
         void prepare(PrepareSpecs specs)
         {
             float sampleRate = specs.sampleRate;
-            monoEffect.prepare(sampleRate);
+            float blockSize = specs.blockSize;
+            monoEffect.prepare(sampleRate, blockSize);
         }
 
         void reset() {}
@@ -118,21 +109,14 @@ namespace project
             auto* leftChannelData = audioBlock.getChannelPointer(0);
             auto* rightChannelData = audioBlock.getChannelPointer(1);
             int blockSize = data.getNumSamples();
-            // Use the mono processing method.
             monoEffect.processMono(leftChannelData, rightChannelData, blockSize);
         }
 
         template <int P>
         void setParameter(double v)
         {
-            if (P == 0)
-            {
-                // Parameter handling...
-            }
-            if (P == 1)
-            {
-                // Additional parameter handling...
-            }
+            if (P == 0) {}
+            if (P == 1) {}
         }
 
         void createParameters(ParameterDataList& data)
@@ -151,15 +135,9 @@ namespace project
             }
         }
 
-        void setExternalData(const ExternalData& ed, int index)
-        {
-            // External data handling...
-        }
+        void setExternalData(const ExternalData& ed, int index) {}
 
-        void handleHiseEvent(HiseEvent& e)
-        {
-            // Event handling...
-        }
+        void handleHiseEvent(HiseEvent& e) {}
 
         template <typename FrameDataType>
         void processFrame(FrameDataType& data) {}
