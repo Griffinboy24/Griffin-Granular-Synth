@@ -1,0 +1,161 @@
+#pragma once
+#include <JuceHeader.h>
+#include "src\massivereverb.h" // Include relative to project structure
+
+namespace project
+{
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+    using namespace juce;
+    using namespace hise;
+    using namespace scriptnode;
+
+    namespace FunctionsClasses {
+        // Implement functions and classes here
+    }
+
+    template <int NV>
+    struct Griffin_Reverb : public data::base
+    {
+        SNEX_NODE(Griffin_Reverb);
+
+        struct MetadataClass
+        {
+            SN_NODE_ID("Griffin_Reverb");
+        };
+
+        //==============================================================================
+        // Node Properties 
+        //==============================================================================
+        static constexpr bool isModNode() { return false; }
+        static constexpr bool isPolyphonic() { return NV > 1; }
+        static constexpr bool hasTail() { return false; }
+        static constexpr bool isSuspendedOnSilence() { return false; }
+        static constexpr int getFixChannelAmount() { return 2; }
+
+        static constexpr int NumTables = 0;
+        static constexpr int NumSliderPacks = 0;
+        static constexpr int NumAudioFiles = 0;
+        static constexpr int NumFilters = 0;
+        static constexpr int NumDisplayBuffers = 0;
+
+        //==============================================================================
+        // Audio Effect Class
+        //==============================================================================
+        class AudioEffect
+        {
+        public:
+            AudioEffect(float initiaParam = 5000.0f)
+                : localParam(initiaParam)
+                , reverb() // Using the modular reverb configuration below.
+            {
+            }
+
+            void prepare(double sampleRate)
+            {
+                reverb.reset();
+            }
+
+            inline void process(float* samples, int numSamples)
+            {
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    samples[i] = reverb.processSample(samples[i]);
+                }
+            }
+
+            void updateParams(float newParam)
+            {
+                localParam = newParam;
+            }
+
+        private:
+            float localParam;
+            // Define a modular reverb using our human-friendly configuration.
+            using MyReverbType = MyReverb::ModularReverb<float,
+                ALLPASS_CONFIG(142, 0.7f),
+                ALLPASS_CONFIG(107, 0.65f),
+                ALLPASS_CONFIG(379, 0.6f),
+                ALLPASS_CONFIG(277, 0.55f),
+                ALLPASS_CONFIG(421, 0.5f)
+            >;
+            MyReverbType reverb;
+        };
+
+        //==============================================================================
+        // Main Processing Functions
+        //==============================================================================
+        void prepare(PrepareSpecs specs)
+        {
+            float sampleRate = specs.sampleRate;
+            float numChannels = specs.numChannels;
+            leftChannelEffect.prepare(sampleRate);
+            rightChannelEffect.prepare(sampleRate);
+        }
+
+        void reset() {}
+
+        template <typename ProcessDataType>
+        void process(ProcessDataType& data)
+        {
+            auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
+            auto audioBlock = fixData.toAudioBlock();
+            auto* leftChannelData = audioBlock.getChannelPointer(0);
+            auto* rightChannelData = audioBlock.getChannelPointer(1);
+            float blockSize = data.getNumSamples();
+            leftChannelEffect.process(leftChannelData, blockSize);
+            rightChannelEffect.process(rightChannelData, blockSize);
+        }
+
+        template <int P>
+        void setParameter(double v)
+        {
+            if (P == 0)
+            {
+                leftChannelEffect.updateParams(static_cast<float>(v));
+                rightChannelEffect.updateParams(static_cast<float>(v));
+            }
+            if (P == 1)
+            {
+                // Additional parameter handling here
+            }
+        }
+
+        void createParameters(ParameterDataList& data)
+        {
+            {
+                parameter::data p("Param", { 20.0, 20000.0, 0.01 });
+                registerCallback<0>(p);
+                p.setDefaultValue(5000.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Param2", { 20.0, 20000.0, 0.01 });
+                registerCallback<0>(p);
+                p.setDefaultValue(5000.0);
+                data.add(std::move(p));
+            }
+        }
+
+        void setExternalData(const ExternalData& ed, int index)
+        {
+            // External data handling...
+        }
+
+        void handleHiseEvent(HiseEvent& e)
+        {
+            // Event handling...
+        }
+
+        template <typename FrameDataType>
+        void processFrame(FrameDataType& data) {}
+
+    private:
+        AudioEffect leftChannelEffect;
+        AudioEffect rightChannelEffect;
+    };
+
+} // namespace project
