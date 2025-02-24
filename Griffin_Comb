@@ -1,0 +1,492 @@
+#pragma once
+#include <JuceHeader.h>
+#include <vector>
+
+
+
+namespace project
+{
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+    using namespace juce;
+    using namespace hise;
+    using namespace scriptnode;
+
+    namespace FunctionsClasses {
+
+        //==========================================================================
+        // Templated SafeDelayLine (with doubled buffer)
+        //--------------------------------------------------------------------------
+        // This version allocates a buffer of size (maxSize * 2) so that when reading
+        // a delayed sample with linear interpolation, the second half of the buffer
+        // serves as a mirror to the first half. This approach prevents any out-of-range
+        // vector accesses.
+        template <typename T>
+        class SafeDelayLine {
+        public:
+            SafeDelayLine() : writeIndex(0), maxSize(0) {}
+
+            // Initialize the delay line with a given maximum delay (in samples).
+            void prepare(int size) {
+                maxSize = size;
+                // Allocate a doubled buffer for safe interpolation.
+                buffer.resize(maxSize * 2, T());
+                writeIndex = 0;
+            }
+
+            // Push a new sample into the delay line.
+            inline void pushSample(const T& sample) {
+                if (maxSize <= 0)
+                    return; // Not prepared yet.
+                // Write the sample in two places: one in the "active" area,
+                // and its mirror in the second half.
+                buffer[writeIndex] = sample;
+                buffer[writeIndex + maxSize] = sample;
+                writeIndex = (writeIndex + 1) % maxSize;
+            }
+
+            // Retrieve a delayed sample using linear interpolation.
+            inline T getSample(float delaySamples) const {
+                if (maxSize <= 0)
+                    return T(); // Not prepared yet.
+                // Compute the read index relative to the current write pointer.
+                float readIndex = static_cast<float>(writeIndex) - delaySamples;
+                // If negative, add maxSize until it becomes positive.
+                while (readIndex < 0)
+                    readIndex += maxSize;
+                int indexA = static_cast<int>(readIndex);
+                int indexB = indexA + 1; // Safe because our buffer is doubled.
+                float frac = readIndex - indexA;
+                return buffer[indexA] * (1.0f - frac) + buffer[indexB] * frac;
+            }
+
+        private:
+            std::vector<T> buffer;
+            int writeIndex;
+            int maxSize;
+        };
+
+        //==========================================================================
+        // CombFilter using the SafeDelayLine
+        //--------------------------------------------------------------------------
+        // This comb filter uses the SafeDelayLine to handle its delay with fractional
+        // (linear) interpolation and feedback.
+        class CombFilter {
+        public:
+            CombFilter() {}
+
+            // Prepare the comb filter given a sample rate.
+            void prepare(double sampleRate) {
+                this->sampleRate = sampleRate;
+                // Calculate maximum delay samples using a minimum frequency of 20 Hz.
+                maxDelaySamples = static_cast<int>(sampleRate / 20.0) + 1;
+                delayLine.prepare(maxDelaySamples);
+                // Initialize smoothed parameters.
+                float initialDelay = static_cast<float>(sampleRate) / frequency;
+                if (initialDelay > maxDelaySamples - 1)
+                    initialDelay = static_cast<float>(maxDelaySamples - 1);
+                smoothedDelaySamples.reset(sampleRate, 0.01);
+                smoothedDelaySamples.setCurrentAndTargetValue(initialDelay);
+                smoothedResonance.reset(sampleRate, 0.01);
+                smoothedResonance.setCurrentAndTargetValue(resonance);
+                smoothedWetDry.reset(sampleRate, 0.01);
+                smoothedWetDry.setCurrentAndTargetValue(1.0f); // Default fully wet.
+            }
+
+            // Update filter parameters with smoothing.
+            // The delay in samples is computed as: delaySamples = sampleRate / frequency.
+            // The value is clamped so that delaySamples never exceeds (maxDelaySamples - 1).
+            // A new parameter wetDry (0.0 = fully dry, 1.0 = fully wet) is added.
+            void updateParameters(float frequency, float resonance, float wetDry) {
+                this->frequency = frequency;
+                this->resonance = resonance;
+                float newDelaySamples = static_cast<float>(sampleRate) / frequency;
+                if (newDelaySamples > maxDelaySamples - 1)
+                    newDelaySamples = static_cast<float>(maxDelaySamples - 1);
+                float rampTime = 0.1f; // 100 ms smoothing time
+
+                // Use setValueAndRampTime() to update the smoothed values.
+                smoothedDelaySamples.setValueAndRampTime(newDelaySamples, sampleRate, rampTime);
+                smoothedResonance.setValueAndRampTime(resonance, sampleRate, rampTime);
+                smoothedWetDry.setValueAndRampTime(wetDry, sampleRate, rampTime);
+            }
+
+            // Process a single sample.
+            float processSample(float input) {
+                float currentDelaySamples = smoothedDelaySamples.getNextValue();
+                float currentResonance = smoothedResonance.getNextValue();
+                float currentWetDry = smoothedWetDry.getNextValue();
+                float delayedSample = delayLine.getSample(currentDelaySamples);
+                float wetOutput = delayedSample;
+                float newSample = input + currentResonance * delayedSample;
+                delayLine.pushSample(newSample);
+                // Mix dry and wet signals according to current wet/dry value.
+                return (1.0f - currentWetDry) * input + currentWetDry * wetOutput;
+            }
+
+        private:
+            double sampleRate = 44100.0;
+            int maxDelaySamples = 0;
+            SafeDelayLine<float> delayLine;
+            float frequency = 440.0f;
+            float resonance = 0.5f;
+            // Smoothed parameters.
+            LinearSmoothedValue<float> smoothedDelaySamples;
+            LinearSmoothedValue<float> smoothedResonance;
+            LinearSmoothedValue<float> smoothedWetDry;
+        };
+
+    } // namespace FunctionsClasses
+
+    //==========================================================================
+    template <int NV>
+    struct Griffin_Comb : public data::base
+    {
+        SNEX_NODE(Griffin_Comb);
+
+        struct MetadataClass
+        {
+            SN_NODE_ID("Griffin_Comb");
+        };
+
+        //==============================================================================
+        // Node Properties 
+        static constexpr bool isModNode() { return false; }
+        static constexpr bool isPolyphonic() { return NV > 1; }
+        static constexpr bool hasTail() { return false; }
+        static constexpr bool isSuspendedOnSilence() { return false; }
+        static constexpr int getFixChannelAmount() { return 2; }
+
+        static constexpr int NumTables = 0;
+        static constexpr int NumSliderPacks = 0;
+        static constexpr int NumAudioFiles = 0;
+        static constexpr int NumFilters = 0;
+        static constexpr int NumDisplayBuffers = 0;
+
+        //==============================================================================
+        // Audio Effect Class 
+        // Implements 5 parallel comb filters.
+        class AudioEffect
+        {
+        public:
+            AudioEffect()
+            {
+                // Set default local frequencies for the 5 comb filters.
+                localFrequencies[0] = 200.0f;
+                localFrequencies[1] = 300.0f;
+                localFrequencies[2] = 400.0f;
+                localFrequencies[3] = 500.0f;
+                localFrequencies[4] = 600.0f;
+                // Set default local resonances.
+                for (int i = 0; i < 5; i++)
+                    localResonances[i] = 0.5f;
+                // Set default local wet/dry values (1.0 = fully wet).
+                for (int i = 0; i < 5; i++)
+                    localWetDry[i] = 1.0f;
+                globalFrequencyOffset = 0.0f;
+                globalResonanceOffset = 0.0f;
+            }
+
+            // Prepare all comb filters.
+            void prepare(double sampleRate)
+            {
+                this->sampleRate = sampleRate;
+                for (int i = 0; i < 5; i++)
+                {
+                    combFilters[i].prepare(sampleRate);
+                    updateCombFilterParameters(i);
+                }
+            }
+
+            // Process a block of samples by summing the outputs of all comb filters.
+            void process(float* samples, int numSamples)
+            {
+                for (int n = 0; n < numSamples; ++n)
+                {
+                    float input = samples[n];
+                    float out = 0.0f;
+                    for (int i = 0; i < 5; i++)
+                    {
+                        // Each comb filter now mixes its own dry input with its wet output.
+                        out += combFilters[i].processSample(input);
+                    }
+                    // Scale the summed output.
+                    samples[n] = out * 0.2f;
+                }
+            }
+
+            // Update parameters based on a fixed mapping.
+            // 0: Global Frequency Offset (-5000 to 5000)
+            // 1: Global Resonance Offset (-0.5 to 0.5)
+            // 2-6: Local Frequencies for comb filters 1-5 (20 to 20000)
+            // 7-11: Local Resonances for comb filters 1-5 (0.0 to 0.99)
+            // 12-16: Local Wet/Dry for comb filters 1-5 (0.0 to 1.0)
+            void updateParam(int index, float value)
+            {
+                if (index == 0)
+                {
+                    globalFrequencyOffset = value;
+                    for (int i = 0; i < 5; i++)
+                        updateCombFilterParameters(i);
+                }
+                else if (index == 1)
+                {
+                    globalResonanceOffset = value;
+                    for (int i = 0; i < 5; i++)
+                        updateCombFilterParameters(i);
+                }
+                else if (index == 2)
+                {
+                    localFrequencies[0] = value;
+                    updateCombFilterParameters(0);
+                }
+                else if (index == 3)
+                {
+                    localFrequencies[1] = value;
+                    updateCombFilterParameters(1);
+                }
+                else if (index == 4)
+                {
+                    localFrequencies[2] = value;
+                    updateCombFilterParameters(2);
+                }
+                else if (index == 5)
+                {
+                    localFrequencies[3] = value;
+                    updateCombFilterParameters(3);
+                }
+                else if (index == 6)
+                {
+                    localFrequencies[4] = value;
+                    updateCombFilterParameters(4);
+                }
+                else if (index == 7)
+                {
+                    localResonances[0] = value;
+                    updateCombFilterParameters(0);
+                }
+                else if (index == 8)
+                {
+                    localResonances[1] = value;
+                    updateCombFilterParameters(1);
+                }
+                else if (index == 9)
+                {
+                    localResonances[2] = value;
+                    updateCombFilterParameters(2);
+                }
+                else if (index == 10)
+                {
+                    localResonances[3] = value;
+                    updateCombFilterParameters(3);
+                }
+                else if (index == 11)
+                {
+                    localResonances[4] = value;
+                    updateCombFilterParameters(4);
+                }
+                else if (index == 12)
+                {
+                    localWetDry[0] = value;
+                    updateCombFilterParameters(0);
+                }
+                else if (index == 13)
+                {
+                    localWetDry[1] = value;
+                    updateCombFilterParameters(1);
+                }
+                else if (index == 14)
+                {
+                    localWetDry[2] = value;
+                    updateCombFilterParameters(2);
+                }
+                else if (index == 15)
+                {
+                    localWetDry[3] = value;
+                    updateCombFilterParameters(3);
+                }
+                else if (index == 16)
+                {
+                    localWetDry[4] = value;
+                    updateCombFilterParameters(4);
+                }
+            }
+
+        private:
+            double sampleRate = 44100.0;
+            FunctionsClasses::CombFilter combFilters[5];
+            float localFrequencies[5];
+            float localResonances[5];
+            float localWetDry[5];
+            float globalFrequencyOffset;
+            float globalResonanceOffset;
+
+            // Compute effective parameters (local + global offset, clamped) and update the filter.
+            void updateCombFilterParameters(int i)
+            {
+                float effFreq = jlimit(20.0f, 20000.0f, localFrequencies[i] + globalFrequencyOffset);
+                float effRes = jlimit(0.0f, 0.99f, localResonances[i] + globalResonanceOffset);
+                float effWet = jlimit(0.0f, 1.0f, localWetDry[i]);
+                combFilters[i].updateParameters(effFreq, effRes, effWet);
+            }
+        };
+
+        //==============================================================================
+        // Main Processing Functions
+        void prepare(PrepareSpecs specs)
+        {
+            float sampleRate = specs.sampleRate;
+            leftChannelEffect.prepare(sampleRate);
+            rightChannelEffect.prepare(sampleRate);
+        }
+
+        void reset() {}
+
+        template <typename ProcessDataType>
+        void process(ProcessDataType& data)
+        {
+            auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
+            auto audioBlock = fixData.toAudioBlock();
+            auto* leftChannelData = audioBlock.getChannelPointer(0);
+            auto* rightChannelData = audioBlock.getChannelPointer(1);
+            float blockSize = data.getNumSamples();
+
+            leftChannelEffect.process(leftChannelData, blockSize);
+            rightChannelEffect.process(rightChannelData, blockSize);
+        }
+
+        template <typename ProcessDataType>
+        void processFrame(ProcessDataType& data) {}
+
+        template <int P>
+        void setParameter(double v)
+        {
+            leftChannelEffect.updateParam(P, static_cast<float>(v));
+            rightChannelEffect.updateParam(P, static_cast<float>(v));
+        }
+
+        void createParameters(ParameterDataList& data)
+        {
+            {
+                parameter::data p("Global Freq Offset", { -100.0, 100.0, 0.001 });
+                registerCallback<0>(p);
+                p.setDefaultValue(0.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Global Resonance Offset", { -0.3, 0.3, 0.001 });
+                registerCallback<1>(p);
+                p.setDefaultValue(0.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 1 Freq", { 20.0, 20000.0, 0.01 });
+                registerCallback<2>(p);
+                p.setDefaultValue(200.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 2 Freq", { 20.0, 20000.0, 0.01 });
+                registerCallback<3>(p);
+                p.setDefaultValue(300.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 3 Freq", { 20.0, 20000.0, 0.01 });
+                registerCallback<4>(p);
+                p.setDefaultValue(400.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 4 Freq", { 20.0, 20000.0, 0.01 });
+                registerCallback<5>(p);
+                p.setDefaultValue(500.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 5 Freq", { 20.0, 20000.0, 0.01 });
+                registerCallback<6>(p);
+                p.setDefaultValue(600.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 1 Resonance", { 0.0, 0.99, 0.001 });
+                registerCallback<7>(p);
+                p.setDefaultValue(0.5);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 2 Resonance", { 0.0, 0.99, 0.001 });
+                registerCallback<8>(p);
+                p.setDefaultValue(0.5);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 3 Resonance", { 0.0, 0.99, 0.001 });
+                registerCallback<9>(p);
+                p.setDefaultValue(0.5);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 4 Resonance", { 0.0, 0.99, 0.001 });
+                registerCallback<10>(p);
+                p.setDefaultValue(0.5);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 5 Resonance", { 0.0, 0.99, 0.001 });
+                registerCallback<11>(p);
+                p.setDefaultValue(0.5);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 1 Wet/Dry", { 0.0, 1.0, 0.001 });
+                registerCallback<12>(p);
+                p.setDefaultValue(1.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 2 Wet/Dry", { 0.0, 1.0, 0.001 });
+                registerCallback<13>(p);
+                p.setDefaultValue(1.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 3 Wet/Dry", { 0.0, 1.0, 0.001 });
+                registerCallback<14>(p);
+                p.setDefaultValue(1.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 4 Wet/Dry", { 0.0, 1.0, 0.001 });
+                registerCallback<15>(p);
+                p.setDefaultValue(1.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Comb 5 Wet/Dry", { 0.0, 1.0, 0.001 });
+                registerCallback<16>(p);
+                p.setDefaultValue(1.0);
+                data.add(std::move(p));
+            }
+        }
+
+        void setExternalData(const ExternalData& ed, int index)
+        {
+            // Not used in this implementation.
+        }
+
+        void handleHiseEvent(HiseEvent& e)
+        {
+            // Process events as needed.
+        }
+
+    private:
+        AudioEffect leftChannelEffect;
+        AudioEffect rightChannelEffect;
+    };
+
+} // namespace project
