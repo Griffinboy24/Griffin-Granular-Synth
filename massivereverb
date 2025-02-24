@@ -4,9 +4,16 @@
 #include <array>
 #include <cstddef>
 #include <algorithm>
+#include <memory>
+#include <cmath>
 #include <JuceHeader.h>
 
 // xsimd is included in project namespace already
+
+// Define a default sample rate used for computing delay line buffer sizes for modulated filters
+#ifndef DEFAULT_SAMPLE_RATE
+#define DEFAULT_SAMPLE_RATE 44100
+#endif
 
 namespace project
 {
@@ -17,13 +24,54 @@ namespace project
         using AlignedVector = std::vector<T, xsimd::aligned_allocator<T, 32>>;
 
         //------------------------------------------------------------------------------
-        // Scalar access policy (integer delay values only)
-        template <typename T, std::size_t DelayLength>
+        // LFO Interface and a Basic LFO implementation using a sine function.
+        template <typename T>
+        class LFO
+        {
+        public:
+            virtual T getValue() = 0;
+            virtual void setSampleRate(T sampleRate) = 0;
+            virtual ~LFO() {}
+        };
+
+        template <typename T>
+        class BasicLFO : public LFO<T>
+        {
+        public:
+            BasicLFO(T rate, T depth)
+                : rate(rate), depth(depth), phase(0), phaseIncrement(0), scaledDepth(depth)
+            {
+            }
+            T getValue() override
+            {
+                T val = std::sin(static_cast<T>(2 * M_PI) * phase) * scaledDepth;
+                phase += phaseIncrement;
+                if (phase >= static_cast<T>(1.0))
+                    phase -= static_cast<T>(1.0);
+                return val;
+            }
+            void setSampleRate(T sampleRate) override
+            {
+                phaseIncrement = rate / sampleRate;
+                scaledDepth = depth * sampleRate;
+            }
+            T getScaledDepth() const { return scaledDepth; }
+        private:
+            T rate;
+            T depth;
+            T phase;
+            T phaseIncrement;
+            T scaledDepth;
+        };
+
+        //------------------------------------------------------------------------------
+        // Fixed–size DelayLine (for non–modulated filters)
+        template <typename T, std::size_t BufferLength>
         struct ScalarDelayLineAccessPolicy
         {
             static T read(const AlignedVector<T>& buffer, std::size_t writeIndex, std::size_t delayOffset)
             {
-                std::size_t readIndex = (writeIndex + DelayLength - delayOffset) % DelayLength;
+                std::size_t readIndex = (writeIndex + BufferLength - delayOffset) % BufferLength;
                 return buffer[readIndex];
             }
             static void write(AlignedVector<T>& buffer, std::size_t writeIndex, T sample)
@@ -32,17 +80,15 @@ namespace project
             }
         };
 
-        //------------------------------------------------------------------------------
-        // Linear interpolated access policy (supports fractional delay values)
-        template <typename T, std::size_t DelayLength>
+        template <typename T, std::size_t BufferLength>
         struct LinearInterpolatedDelayLineAccessPolicy
         {
             static T read(const AlignedVector<T>& buffer, std::size_t writeIndex, T delayInSamples)
             {
                 int intDelay = static_cast<int>(delayInSamples);
                 T frac = delayInSamples - static_cast<T>(intDelay);
-                std::size_t index0 = (writeIndex + DelayLength - static_cast<std::size_t>(intDelay)) % DelayLength;
-                std::size_t index1 = (index0 + 1) % DelayLength;
+                std::size_t index0 = (writeIndex + BufferLength - static_cast<std::size_t>(intDelay)) % BufferLength;
+                std::size_t index1 = (index0 + 1) % BufferLength;
                 T sample0 = buffer[index0];
                 T sample1 = buffer[index1];
                 return sample0 + frac * (sample1 - sample0);
@@ -53,35 +99,131 @@ namespace project
             }
         };
 
-        //------------------------------------------------------------------------------
-        // Policy-based DelayLine class
-        template <typename T, std::size_t DelayLength,
-            typename AccessPolicy = ScalarDelayLineAccessPolicy<T, DelayLength>>
+        // Fixed–size DelayLine class.
+        template <typename T, std::size_t BufferLength,
+            typename AccessPolicy = ScalarDelayLineAccessPolicy<T, BufferLength>>
             class DelayLine
         {
         public:
-            DelayLine() : buffer(DelayLength, T(0)), writeIndex(0) {}
+            DelayLine() : buffer(BufferLength, T(0)), writeIndex(0) {}
             T read(std::size_t delayOffset) const { return AccessPolicy::read(buffer, writeIndex, delayOffset); }
             T readFractional(T delayInSamples) const { return AccessPolicy::read(buffer, writeIndex, delayInSamples); }
             void write(T sample) { AccessPolicy::write(buffer, writeIndex, sample); advance(); }
             void reset() { std::fill(buffer.begin(), buffer.end(), T(0)); writeIndex = 0; }
         private:
-            void advance() { writeIndex = (writeIndex + 1) % DelayLength; }
+            void advance() { writeIndex = (writeIndex + 1) % BufferLength; }
             AlignedVector<T> buffer;
             std::size_t writeIndex;
         };
 
         //------------------------------------------------------------------------------
-        // Templatized Allpass Filter
-        template <typename T, std::size_t DelayLength,
-            typename AccessPolicy = ScalarDelayLineAccessPolicy<T, DelayLength>>
+        // Dynamic DelayLine class (for modulated filters with runtime–determined buffer size)
+        template <typename T>
+        class DynamicDelayLine
+        {
+        public:
+            DynamicDelayLine() : writeIndex(0) {}
+            void setBufferSize(std::size_t newSize)
+            {
+                buffer.resize(newSize, T(0));
+                bufferSize = newSize;
+                writeIndex = 0;
+            }
+            T readFractional(T delayInSamples) const
+            {
+                int intDelay = static_cast<int>(delayInSamples);
+                T frac = delayInSamples - static_cast<T>(intDelay);
+                std::size_t index0 = (writeIndex + bufferSize - static_cast<std::size_t>(intDelay)) % bufferSize;
+                std::size_t index1 = (index0 + 1) % bufferSize;
+                T sample0 = buffer[index0];
+                T sample1 = buffer[index1];
+                return sample0 + frac * (sample1 - sample0);
+            }
+            void write(T sample)
+            {
+                buffer[writeIndex] = sample;
+                writeIndex = (writeIndex + 1) % bufferSize;
+            }
+            void reset()
+            {
+                std::fill(buffer.begin(), buffer.end(), T(0));
+                writeIndex = 0;
+            }
+        private:
+            AlignedVector<T> buffer;
+            std::size_t bufferSize = 0;
+            std::size_t writeIndex;
+        };
+
+        //------------------------------------------------------------------------------
+        // AllpassConfig structures.
+        template <std::size_t DelayLength, int Gain1000>
+        struct AllpassConfig
+        {
+            static constexpr std::size_t delayLength = DelayLength;
+            static constexpr float gain = static_cast<float>(Gain1000) / 1000.0f;
+        };
+
+        template <std::size_t DelayLength, int Gain1000, int LFORate1000, int LFODepth1000>
+        struct AllpassModConfig
+        {
+            static constexpr std::size_t delayLength = DelayLength;
+            static constexpr float gain = static_cast<float>(Gain1000) / 1000.0f;
+            static constexpr float lfoRate = static_cast<float>(LFORate1000) / 1000.0f;
+            static constexpr float lfoDepth = static_cast<float>(LFODepth1000) / 1000.0f;
+        };
+
+#define ALLPASS_CONFIG(delay, gain) project::MyReverb::AllpassConfig<delay, (int)((gain)*1000)>
+#define ALLPASS_MOD_CONFIG(delay, gain, rate, depth) project::MyReverb::AllpassModConfig<delay, (int)((gain)*1000), (int)((rate)*1000), (int)((depth)*1000)>
+
+        //------------------------------------------------------------------------------
+        // Trait to detect modulated config.
+        template <typename Config>
+        struct is_modulated { static constexpr bool value = false; };
+
+        template <std::size_t D, int G, int LR, int LD>
+        struct is_modulated< AllpassModConfig<D, G, LR, LD> >
+        {
+            static constexpr bool value = true;
+        };
+
+        //------------------------------------------------------------------------------
+        // For non–modulated filters, use fixed–size delay lines computed at compile–time.
+        template <typename Config>
+        struct DelayLengths
+        {
+            static constexpr std::size_t base = Config::delayLength;
+            static constexpr std::size_t buffer = Config::delayLength;
+        };
+
+        //------------------------------------------------------------------------------
+        // Allpass Filter for non–modulated cases (unchanged)
+        template <typename T, std::size_t BaseDelay, std::size_t BufferDelay,
+            typename AccessPolicy = ScalarDelayLineAccessPolicy<T, BufferDelay>>
             class AllpassFilter
         {
         public:
-            explicit AllpassFilter(T gainValue) : gain(gainValue) {}
+            explicit AllpassFilter(T gainValue)
+                : gain(gainValue), modulator(nullptr),
+                runtimeModMargin(static_cast<T>((BufferDelay - BaseDelay - 1) / 2))
+            {
+            }
+           // void setModulator(LFO<T>* lfo) { modulator = llo; } // <- Typo fixed below!
+            void setModulator(LFO<T>* lfo) { modulator = lfo; }
+            void setSampleRate(T sampleRate)
+            {
+                if (modulator)
+                {
+                    modulator->setSampleRate(sampleRate);
+                    if (auto basic = dynamic_cast<BasicLFO<T>*>(modulator))
+                        runtimeModMargin = basic->getScaledDepth();
+                }
+            }
             inline T processSample(T input)
             {
-                T delayedSample = delayLine.read(DelayLength);
+                T mod = (modulator ? modulator->getValue() : static_cast<T>(0));
+                T effectiveDelay = static_cast<T>(BaseDelay) + runtimeModMargin + mod;
+                T delayedSample = delayLine.readFractional(effectiveDelay);
                 T output = -gain * input + delayedSample;
                 T newDelaySample = input + gain * output;
                 delayLine.write(newDelaySample);
@@ -92,20 +234,72 @@ namespace project
             inline void setGain(T newGain) { gain = newGain; }
         private:
             T gain;
-            DelayLine<T, DelayLength, AccessPolicy> delayLine;
+            DelayLine<T, BufferDelay, AccessPolicy> delayLine;
+            LFO<T>* modulator;
+            T runtimeModMargin;
+        };
+
+        //------------------------------------------------------------------------------
+        // Allpass Filter for modulated cases using a dynamic delay line.
+        template <typename T, std::size_t BaseDelay>
+        class AllpassFilterDynamic
+        {
+        public:
+            explicit AllpassFilterDynamic(T gainValue)
+                : gain(gainValue), modulator(nullptr), runtimeModMargin(0), baseDelay(BaseDelay), dynamicBufferSize(0)
+            {
+            }
+       
+            void setModulator(LFO<T>* lfo) { modulator = lfo; }
+            void setSampleRate(T sampleRate)
+            {
+                if (modulator)
+                {
+                    modulator->setSampleRate(sampleRate);
+                    if (auto basic = dynamic_cast<BasicLFO<T>*>(modulator))
+                        runtimeModMargin = basic->getScaledDepth();
+                }
+                else
+                {
+                    runtimeModMargin = 0;
+                }
+                std::size_t modMargin = static_cast<std::size_t>(std::ceil(runtimeModMargin));
+                dynamicBufferSize = BaseDelay + 2 * modMargin + 1;
+                delayLine.setBufferSize(dynamicBufferSize);
+            }
+            inline T processSample(T input)
+            {
+                T mod = (modulator ? modulator->getValue() : static_cast<T>(0));
+                T effectiveDelay = static_cast<T>(BaseDelay) + runtimeModMargin + mod;
+                T delayedSample = delayLine.readFractional(effectiveDelay);
+                T output = -gain * input + delayedSample;
+                T newDelaySample = input + gain * output;
+                delayLine.write(newDelaySample);
+                return output;
+            }
+            inline void reset() { delayLine.reset(); }
+            inline T getGain() const { return gain; }
+            inline void setGain(T newGain) { gain = newGain; }
+        private:
+            T gain;
+            LFO<T>* modulator;
+            T runtimeModMargin;
+            const std::size_t baseDelay;
+            std::size_t dynamicBufferSize;
+            DynamicDelayLine<T> delayLine;
         };
 
         //------------------------------------------------------------------------------
         // Series Network of Allpass Filters (Reverb Architecture)
-        template <typename T, std::size_t DelayLength, std::size_t NumFilters,
-            typename AccessPolicy = ScalarDelayLineAccessPolicy<T, DelayLength>>
+        template <typename T, std::size_t BaseDelay, std::size_t BufferDelay, std::size_t NumFilters,
+            typename AccessPolicy = ScalarDelayLineAccessPolicy<T, BufferDelay>>
             class SeriesAllpassReverb
         {
         public:
             explicit SeriesAllpassReverb(T gainValue)
             {
                 for (auto& filter : filters)
-                    filter = AllpassFilter<T, DelayLength, AccessPolicy>(gainValue);
+                    filter = AllpassFilter<T, BaseDelay, BufferDelay, AccessPolicy>(gainValue);
             }
             inline T processSample(T input)
             {
@@ -119,28 +313,32 @@ namespace project
                 for (auto& filter : filters)
                     filter.reset();
             }
+            inline void setSampleRate(T sampleRate)
+            {
+                for (auto& filter : filters)
+                    filter.setSampleRate(sampleRate);
+            }
         private:
-            std::array<AllpassFilter<T, DelayLength, AccessPolicy>, NumFilters> filters;
+            std::array<AllpassFilter<T, BaseDelay, BufferDelay, AccessPolicy>, NumFilters> filters;
         };
 
         //------------------------------------------------------------------------------
         // Multi-Series Allpass Reverb with individual parameters.
         template <typename T,
-            std::size_t DelayLength0,
-            std::size_t DelayLength1,
-            std::size_t DelayLength2,
-            std::size_t DelayLength3,
-            std::size_t DelayLength4,
-            typename AccessPolicy0 = ScalarDelayLineAccessPolicy<T, DelayLength0>,
-            typename AccessPolicy1 = ScalarDelayLineAccessPolicy<T, DelayLength1>,
-            typename AccessPolicy2 = ScalarDelayLineAccessPolicy<T, DelayLength2>,
-            typename AccessPolicy3 = ScalarDelayLineAccessPolicy<T, DelayLength3>,
-            typename AccessPolicy4 = ScalarDelayLineAccessPolicy<T, DelayLength4>>
-            class MultiSeriesAllpassReverb
+            typename Config0,
+            typename Config1,
+            typename Config2,
+            typename Config3,
+            typename Config4>
+        class MultiSeriesAllpassReverb
         {
         public:
             MultiSeriesAllpassReverb(T g0, T g1, T g2, T g3, T g4)
-                : filter0(g0), filter1(g1), filter2(g2), filter3(g3), filter4(g4)
+                : filter0(createFilter<Config0>(g0)),
+                filter1(createFilter<Config1>(g1)),
+                filter2(createFilter<Config2>(g2)),
+                filter3(createFilter<Config3>(g3)),
+                filter4(createFilter<Config4>(g4))
             {
             }
             inline T processSample(T input)
@@ -160,46 +358,58 @@ namespace project
                 filter3.reset();
                 filter4.reset();
             }
+            inline void setSampleRate(T sampleRate)
+            {
+                filter0.setSampleRate(sampleRate);
+                filter1.setSampleRate(sampleRate);
+                filter2.setSampleRate(sampleRate);
+                filter3.setSampleRate(sampleRate);
+                filter4.setSampleRate(sampleRate);
+            }
         private:
-            AllpassFilter<T, DelayLength0, AccessPolicy0> filter0;
-            AllpassFilter<T, DelayLength1, AccessPolicy1> filter1;
-            AllpassFilter<T, DelayLength2, AccessPolicy2> filter2;
-            AllpassFilter<T, DelayLength3, AccessPolicy3> filter3;
-            AllpassFilter<T, DelayLength4, AccessPolicy4> filter4;
+            template <typename Config>
+            static auto createFilter(T gain)
+            {
+                if constexpr (is_modulated<Config>::value)
+                {
+                    return AllpassFilterDynamic<T, DelayLengths<Config>::base>(gain);
+                }
+                else
+                {
+                    constexpr std::size_t base = DelayLengths<Config>::base;
+                    constexpr std::size_t buffer = DelayLengths<Config>::buffer;
+                    using AccessPolicy = typename std::conditional<is_modulated<Config>::value,
+                        LinearInterpolatedDelayLineAccessPolicy<T, buffer>,
+                        ScalarDelayLineAccessPolicy<T, buffer>
+                    >::type;
+                    return AllpassFilter<T, base, buffer, AccessPolicy>(gain);
+                }
+            }
+            decltype(createFilter<Config0>(T(0))) filter0;
+            decltype(createFilter<Config1>(T(0))) filter1;
+            decltype(createFilter<Config2>(T(0))) filter2;
+            decltype(createFilter<Config3>(T(0))) filter3;
+            decltype(createFilter<Config4>(T(0))) filter4;
         };
 
         //------------------------------------------------------------------------------
-        // Modular Reverb Creator
-        //
-        // Note: To avoid floating-point non-type template parameters pre-C++20, gains are specified as integer thousandths.
-        // For example, a gain of 0.7 is represented as 700.
-        template <std::size_t DelayLength, int Gain1000>
-        struct AllpassConfig
-        {
-            static constexpr std::size_t delayLength = DelayLength;
-            static constexpr float gain = static_cast<float>(Gain1000) / 1000.0f;
-        };
-
-        // Macro to simplify AllpassConfig creation.
-        // Fully qualifies the type to ensure proper lookup.
-#define ALLPASS_CONFIG(delay, gain) project::MyReverb::AllpassConfig<delay, (int)((gain)*1000)>
-
         // ModularReverb: a compile-time configurable series reverb built from a variadic list of AllpassConfig types.
         template <typename T, typename... Configs>
         class ModularReverb
         {
         public:
-            ModularReverb() : filters{ AllpassFilter<T, Configs::delayLength>(Configs::gain)... } {}
-
-            // Process a single sample through the chain.
+            ModularReverb()
+                : filters{ createFilter<Configs>()... },
+                modulators{ createModulator<Configs>()... }
+            {
+                assignModulatorsIndices(std::make_index_sequence<sizeof...(Configs)>{});
+            }
             inline T processSample(T input)
             {
                 T out = input;
                 std::apply([&](auto&... filter) { ((out = filter.processSample(out)), ...); }, filters);
                 return out;
             }
-
-            // Process an entire block of samples.
             inline void processBlock(T* samples, int numSamples)
             {
                 for (int i = 0; i < numSamples; ++i)
@@ -209,13 +419,70 @@ namespace project
                     samples[i] = out;
                 }
             }
-
             inline void reset()
             {
                 std::apply([](auto&... filter) { (filter.reset(), ...); }, filters);
             }
+            template <std::size_t Index>
+            void setModulator(LFO<T>* lfo)
+            {
+                std::get<Index>(filters).setModulator(lfo);
+            }
+            void setLfoSampleRate(T sampleRate)
+            {
+                for (auto& mod : modulators)
+                {
+                    if (mod)
+                        mod->setSampleRate(sampleRate);
+                }
+                std::apply([sampleRate](auto&... filter) { ((filter.setSampleRate(sampleRate)), ...); }, filters);
+            }
         private:
-            std::tuple<AllpassFilter<T, Configs::delayLength>...> filters;
+            template <typename Config>
+            static auto createFilter()
+            {
+                if constexpr (is_modulated<Config>::value)
+                {
+                    return createDynamicFilter<Config>();
+                }
+                else
+                {
+                    constexpr std::size_t base = DelayLengths<Config>::base;
+                    constexpr std::size_t buffer = DelayLengths<Config>::buffer;
+                    using AccessPolicy = typename std::conditional<is_modulated<Config>::value,
+                        LinearInterpolatedDelayLineAccessPolicy<T, buffer>,
+                        ScalarDelayLineAccessPolicy<T, buffer>
+                    >::type;
+                    return AllpassFilter<T, base, buffer, AccessPolicy>(Config::gain);
+                }
+            }
+            template <typename Config>
+            static auto createDynamicFilter()
+            {
+                return AllpassFilterDynamic<T, DelayLengths<Config>::base>(Config::gain);
+            }
+            // Added missing createModulator function template.
+            template <typename Config>
+            static std::unique_ptr<LFO<T>> createModulator()
+            {
+                if constexpr (is_modulated<Config>::value)
+                    return std::make_unique<BasicLFO<T>>(Config::lfoRate, Config::lfoDepth);
+                else
+                    return nullptr;
+            }
+            std::tuple<decltype(createFilter<Configs>())...> filters;
+            std::array<std::unique_ptr<LFO<T>>, sizeof...(Configs)> modulators;
+            template <std::size_t I, typename Config>
+            void assignModulatorHelper()
+            {
+                if constexpr (is_modulated<Config>::value)
+                    std::get<I>(filters).setModulator(modulators[I].get());
+            }
+            template <std::size_t... Is>
+            void assignModulatorsIndices(std::index_sequence<Is...>)
+            {
+                (assignModulatorHelper<Is, std::tuple_element_t<Is, std::tuple<Configs...>>>(), ...);
+            }
         };
 
     } // namespace MyReverb
