@@ -184,18 +184,32 @@ namespace project
         // Fully qualifies the type to ensure proper lookup.
 #define ALLPASS_CONFIG(delay, gain) project::MyReverb::AllpassConfig<delay, (int)((gain)*1000)>
 
-// ModularReverb: a compile-time configurable series reverb built from a variadic list of AllpassConfig types.
+        // ModularReverb: a compile-time configurable series reverb built from a variadic list of AllpassConfig types.
         template <typename T, typename... Configs>
         class ModularReverb
         {
         public:
             ModularReverb() : filters{ AllpassFilter<T, Configs::delayLength>(Configs::gain)... } {}
+
+            // Process a single sample through the chain.
             inline T processSample(T input)
             {
                 T out = input;
                 std::apply([&](auto&... filter) { ((out = filter.processSample(out)), ...); }, filters);
                 return out;
             }
+
+            // Process an entire block of samples.
+            inline void processBlock(T* samples, int numSamples)
+            {
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    T out = samples[i];
+                    std::apply([&](auto&... filter) { ((out = filter.processSample(out)), ...); }, filters);
+                    samples[i] = out;
+                }
+            }
+
             inline void reset()
             {
                 std::apply([](auto&... filter) { (filter.reset(), ...); }, filters);
