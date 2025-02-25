@@ -3,6 +3,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <array>
 
 namespace project {
     using namespace juce;
@@ -143,13 +144,46 @@ namespace project {
             int indexMask;
         };
 
+        // Templated Modular Reverb class that chains multiple AllpassDelayLine filters at compile-time.
+        template <size_t NumStages,
+            typename AllpassFilter = AllpassDelayLine<DefaultDelayPolicy, DefaultModulatorPolicy, DefaultCoefficientPolicy>>
+            class ModularReverb {
+            public:
+                ModularReverb() : sampleRate(44100.f) {}
+
+                // Prepare all allpass filters.
+                void prepare(float sr) {
+                    sampleRate = sr;
+                    for (auto& filter : filters)
+                        filter.prepare(sr);
+                }
+
+                // Reset all allpass filters.
+                void reset() {
+                    for (auto& filter : filters)
+                        filter.reset();
+                }
+
+                // Process a single sample through the chain of allpass filters.
+                inline float processSample(float x) {
+                    float y = x;
+                    for (auto& filter : filters)
+                        y = filter.processSample(y);
+                    return y;
+                }
+
+            private:
+                float sampleRate;
+                std::array<AllpassFilter, NumStages> filters;
+        };
+
     } // namespace FunctionsClasses
 
     //=============================================================================
-    // Griffin_Reverb Node Definition Integrating the Optimized All-Pass Filter
+    // Griffin_Reverb Node Definition Integrating the Optimized Modular Reverb
     // with Mono Summing for Fake Stereo Reverb Processing.
     //=============================================================================
-    template <int NV>
+    template <int NV, size_t NumStages = 1>
     struct Griffin_Reverb : public data::base {
         SNEX_NODE(Griffin_Reverb);
 
@@ -169,52 +203,46 @@ namespace project {
         static constexpr int NumFilters = 0;
         static constexpr int NumDisplayBuffers = 0;
 
-        // Typedef the compile-time allpass filter using the default policies.
-        using AllpassFilterType = FunctionsClasses::AllpassDelayLine<
-            FunctionsClasses::DefaultDelayPolicy,
-            FunctionsClasses::DefaultModulatorPolicy,
-            FunctionsClasses::DefaultCoefficientPolicy>;
-
-        // Single AudioEffect instance for mono processing.
-        class AudioEffect {
+        // AudioReverb class replacing the old AudioEffect.
+        class AudioReverb {
         public:
-            AudioEffect() : sampleRate(44100.f) {}
+            AudioReverb() : sampleRate(44100.f) {}
 
-            // Prepare the audio effect; note that parameters are now compile-time.
+            // Prepare the reverb; note that parameters are now compile-time.
             void prepare(double sr) {
                 sampleRate = sr;
-                allpassFilter.prepare(static_cast<float>(sampleRate));
+                reverb.prepare(static_cast<float>(sampleRate));
             }
 
             // Process an audio buffer in-place.
             inline void process(float* samples, int numSamples) {
                 for (int i = 0; i < numSamples; ++i)
-                    samples[i] = allpassFilter.processSample(samples[i]);
+                    samples[i] = reverb.processSample(samples[i]);
             }
 
             void reset() {
-                allpassFilter.reset();
+                reverb.reset();
             }
 
         private:
             double sampleRate;
-            AllpassFilterType allpassFilter;
+            FunctionsClasses::ModularReverb<NumStages> reverb;
         };
 
-        // Use a single AudioEffect instance for mono processing.
-        AudioEffect monoEffect;
+        // Use a single AudioReverb instance for mono processing.
+        AudioReverb monoReverb;
         // Pre-allocated mono buffer sized to the maximum block size.
         std::vector<float> monoBuffer;
 
         void prepare(PrepareSpecs specs) {
             float sampleRate = specs.sampleRate;
-            monoEffect.prepare(sampleRate);
+            monoReverb.prepare(sampleRate);
             // Resize monoBuffer to the maximum expected block size.
             monoBuffer.resize(static_cast<size_t>(specs.blockSize));
         }
 
         void reset() {
-            monoEffect.reset();
+            monoReverb.reset();
         }
 
         template <typename ProcessDataType>
@@ -230,8 +258,8 @@ namespace project {
             FloatVectorOperations::add(monoBuffer.data(), rightChannelData, blockSize);
             FloatVectorOperations::multiply(monoBuffer.data(), 0.5f, blockSize);
 
-            // Process the mono buffer through the allpass filter.
-            monoEffect.process(monoBuffer.data(), blockSize);
+            // Process the mono buffer through the modular reverb.
+            monoReverb.process(monoBuffer.data(), blockSize);
 
             // Write the processed mono signal back to both channels.
             FloatVectorOperations::copy(leftChannelData, monoBuffer.data(), blockSize);
@@ -249,7 +277,6 @@ namespace project {
 
         template <typename FrameDataType>
         void processFrame(FrameDataType& data) {}
-
     };
 
 } // namespace project
