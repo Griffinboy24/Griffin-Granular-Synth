@@ -11,19 +11,35 @@ namespace project {
 
     namespace FunctionsClasses {
 
+        // Policy for delay attributes
+        struct DefaultDelayPolicy {
+            static constexpr float baseDelayMs = 10.f;   // compile-time delay (ms)
+            static constexpr float maxDelayMs = 50.f;      // maximum delay time (ms)
+        };
+
+        // Policy for modulator attributes
+        struct DefaultModulatorPolicy {
+            static constexpr float lfoFrequency = 1.9128f; // LFO frequency (Hz)
+            static constexpr float modDepth = 0.3f;          // modulation depth
+        };
+
+        // Policy for coefficient (all compile-time)
+        struct DefaultCoefficientPolicy {
+            static constexpr float value = 0.5f;           // fixed coefficient value
+        };
+
+        // Templated compile-time Allpass Delay Line using policy classes.
+        template <typename DelayPolicy = DefaultDelayPolicy,
+            typename ModulatorPolicy = DefaultModulatorPolicy,
+            typename CoefficientPolicy = DefaultCoefficientPolicy>
         class AllpassDelayLine {
         public:
             AllpassDelayLine()
                 : sampleRate(44100.f),
-                baseDelayMs(10.f), // Now internally controlled
-                baseCoeff(0.5f),
-                lfoFrequency(1.9128f),
-                modDepth(0.3f),
-                smoothedDelay(10.f),
-                smoothedCoeff(0.5f),
+                smoothedDelay(DelayPolicy::baseDelayMs),
+                smoothedCoeff(CoefficientPolicy::value),
                 lfoPhase(0.f),
                 writeIndex(0),
-                maxDelayMs(50.f),
                 factorDelay(44.1f),
                 powerBufferSize(0),
                 indexMask(0),
@@ -32,58 +48,49 @@ namespace project {
             }
 
             ~AllpassDelayLine() = default;
-
             AllpassDelayLine(const AllpassDelayLine&) = delete;
             AllpassDelayLine& operator=(const AllpassDelayLine&) = delete;
 
-            void prepare(float sr, float initDelayMs, float initCoeff,
-                float lfoFreq, float modulationDepth)
-            {
+            // Prepare the delay line with the given sample rate.
+            // This will compute the internal parameters and resize the buffer.
+            void prepare(float sr) {
                 sampleRate = sr;
-                baseDelayMs = initDelayMs; // Internal, not user-controlled
-                baseCoeff = initCoeff;
-                lfoFrequency = lfoFreq;
-                modDepth = modulationDepth;
-                smoothedDelay = baseDelayMs;
-                smoothedCoeff = baseCoeff;
+                smoothedDelay = DelayPolicy::baseDelayMs;
+                smoothedCoeff = CoefficientPolicy::value;
                 lfoPhase = 0.f;
                 writeIndex = 0;
-                maxDelayMs = 50.f;
                 factorDelay = sampleRate / 1000.f;
-                lfoIncrement = lfoFrequency / sampleRate; // Precompute LFO increment
+                lfoIncrement = ModulatorPolicy::lfoFrequency / sampleRate;
 
-                int reqSize = static_cast<int>(std::ceil(maxDelayMs * factorDelay)) + 4;
+                int reqSize = static_cast<int>(std::ceil(DelayPolicy::maxDelayMs * factorDelay)) + 4;
                 powerBufferSize = nextPow2(reqSize);
                 indexMask = powerBufferSize - 1;
                 delayBuffer.resize(powerBufferSize, 0.f);
             }
 
+            // Reset the delay line to its initial state.
             void reset() {
                 std::fill(delayBuffer.begin(), delayBuffer.end(), 0.f);
                 writeIndex = 0;
-                smoothedDelay = baseDelayMs;
-                smoothedCoeff = baseCoeff;
+                smoothedDelay = DelayPolicy::baseDelayMs;
+                smoothedCoeff = CoefficientPolicy::value;
                 lfoPhase = 0.f;
             }
 
-            // Removed setDelay to ensure delay time is controlled internally
-            inline void setCoefficient(float newCoeff) {
-                baseCoeff = newCoeff;
-            }
-
+            // Process a single sample through the allpass filter.
             inline float processSample(float x) {
                 // --- LFO Update and Coefficient Modulation ---
                 lfoPhase += lfoIncrement;
                 if (lfoPhase >= 1.f)
                     lfoPhase -= 1.f;
                 float modValue = parSin(lfoPhase);
-                float targetCoeff = baseCoeff + modDepth * modValue;
-                // Branchless clamp
+                float targetCoeff = CoefficientPolicy::value + ModulatorPolicy::modDepth * modValue;
+                // Branchless clamping
                 targetCoeff = (targetCoeff < -0.99f) ? -0.99f : ((targetCoeff > 0.99f) ? 0.99f : targetCoeff);
                 static constexpr float smoothingFactor = 0.01f;
                 float oneMinusSmooth = 1.f - smoothingFactor;
                 smoothedCoeff = oneMinusSmooth * smoothedCoeff + smoothingFactor * targetCoeff;
-                smoothedDelay = oneMinusSmooth * smoothedDelay + smoothingFactor * baseDelayMs;
+                smoothedDelay = oneMinusSmooth * smoothedDelay + smoothingFactor * DelayPolicy::baseDelayMs;
 
                 // --- Fractional Delay Calculation ---
                 float D = smoothedDelay * factorDelay;
@@ -107,11 +114,13 @@ namespace project {
             }
 
         private:
+            // Approximated parabolic sine function used for LFO modulation.
             inline float parSin(float ph) {
                 float shifted = 0.5f - ph;
                 return shifted * (8.f - 16.f * std::fabs(shifted));
             }
 
+            // Compute next power of two (for efficient buffer sizing)
             static int nextPow2(int x) {
                 x--;
                 x |= x >> 1;
@@ -123,26 +132,22 @@ namespace project {
             }
 
             float sampleRate;
-            float baseDelayMs;
-            float baseCoeff;
-            float lfoFrequency;
-            float modDepth;
             float smoothedDelay;
             float smoothedCoeff;
             float lfoPhase;
             std::vector<float> delayBuffer;
             int writeIndex;
             float factorDelay;
-            float maxDelayMs;
+            float lfoIncrement;
             int powerBufferSize;
             int indexMask;
-            float lfoIncrement; // Precomputed LFO increment
         };
 
     } // namespace FunctionsClasses
 
     //=============================================================================
     // Griffin_Reverb Node Definition Integrating the Optimized All-Pass Filter
+    // with Mono Summing for Fake Stereo Reverb Processing.
     //=============================================================================
     template <int NV>
     struct Griffin_Reverb : public data::base {
@@ -164,29 +169,27 @@ namespace project {
         static constexpr int NumFilters = 0;
         static constexpr int NumDisplayBuffers = 0;
 
+        // Typedef the compile-time allpass filter using the default policies.
+        using AllpassFilterType = FunctionsClasses::AllpassDelayLine<
+            FunctionsClasses::DefaultDelayPolicy,
+            FunctionsClasses::DefaultModulatorPolicy,
+            FunctionsClasses::DefaultCoefficientPolicy>;
+
+        // Single AudioEffect instance for mono processing.
         class AudioEffect {
         public:
-            AudioEffect() : baseDelayMs(10.f), baseCoefficient(0.5f), sampleRate(44100.f) {}
+            AudioEffect() : sampleRate(44100.f) {}
 
+            // Prepare the audio effect; note that parameters are now compile-time.
             void prepare(double sr) {
                 sampleRate = sr;
-                // Note: The delay time is now controlled internally.
-                allpassFilter.prepare(static_cast<float>(sampleRate),
-                    baseDelayMs,
-                    baseCoefficient,
-                    1.5128f,  // LFO frequency
-                    0.4f);    // Modulation depth
+                allpassFilter.prepare(static_cast<float>(sampleRate));
             }
 
+            // Process an audio buffer in-place.
             inline void process(float* samples, int numSamples) {
                 for (int i = 0; i < numSamples; ++i)
                     samples[i] = allpassFilter.processSample(samples[i]);
-            }
-
-            // Removed setDelay to enforce internal control of delay time.
-            void setCoefficient(float newCoefficient) {
-                baseCoefficient = newCoefficient;
-                allpassFilter.setCoefficient(newCoefficient);
             }
 
             void reset() {
@@ -194,21 +197,24 @@ namespace project {
             }
 
         private:
-            float baseDelayMs;      // Internally controlled delay time
-            float baseCoefficient;
             double sampleRate;
-            FunctionsClasses::AllpassDelayLine allpassFilter;
+            AllpassFilterType allpassFilter;
         };
+
+        // Use a single AudioEffect instance for mono processing.
+        AudioEffect monoEffect;
+        // Pre-allocated mono buffer sized to the maximum block size.
+        std::vector<float> monoBuffer;
 
         void prepare(PrepareSpecs specs) {
             float sampleRate = specs.sampleRate;
-            leftChannelEffect.prepare(sampleRate);
-            rightChannelEffect.prepare(sampleRate);
+            monoEffect.prepare(sampleRate);
+            // Resize monoBuffer to the maximum expected block size.
+            monoBuffer.resize(static_cast<size_t>(specs.blockSize));
         }
 
         void reset() {
-            leftChannelEffect.reset();
-            rightChannelEffect.reset();
+            monoEffect.reset();
         }
 
         template <typename ProcessDataType>
@@ -219,26 +225,22 @@ namespace project {
             auto* rightChannelData = audioBlock.getChannelPointer(1);
             int blockSize = data.getNumSamples();
 
-            leftChannelEffect.process(leftChannelData, blockSize);
-            rightChannelEffect.process(rightChannelData, blockSize);
+            // Sum left and right channels into monoBuffer: mono = (left + right) / 2.
+            FloatVectorOperations::copy(monoBuffer.data(), leftChannelData, blockSize);
+            FloatVectorOperations::add(monoBuffer.data(), rightChannelData, blockSize);
+            FloatVectorOperations::multiply(monoBuffer.data(), 0.5f, blockSize);
+
+            // Process the mono buffer through the allpass filter.
+            monoEffect.process(monoBuffer.data(), blockSize);
+
+            // Write the processed mono signal back to both channels.
+            FloatVectorOperations::copy(leftChannelData, monoBuffer.data(), blockSize);
+            FloatVectorOperations::copy(rightChannelData, monoBuffer.data(), blockSize);
         }
 
-        // Only the coefficient is now a user parameter.
-        template <int P>
-        void setParameter(double v) {
-            if (P == 0) {
-                leftChannelEffect.setCoefficient(static_cast<float>(v));
-                rightChannelEffect.setCoefficient(static_cast<float>(v));
-            }
-        }
-
+        // The runtime coefficient parameter is now removed to enforce compile-time control.
         void createParameters(ParameterDataList& data) {
-            {
-                parameter::data p("Coefficient", { -0.99, 0.99, 0.001 });
-                registerCallback<0>(p);
-                p.setDefaultValue(0.5);
-                data.add(std::move(p));
-            }
+            // No user parameters for coefficient.
         }
 
         void handleHiseEvent(HiseEvent& e) {
@@ -248,9 +250,6 @@ namespace project {
         template <typename FrameDataType>
         void processFrame(FrameDataType& data) {}
 
-    private:
-        AudioEffect leftChannelEffect;
-        AudioEffect rightChannelEffect;
     };
 
 } // namespace project
