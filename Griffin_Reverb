@@ -1,106 +1,126 @@
 #pragma once
 #include <JuceHeader.h>
-#include <vector>
+#include <array>
 #include <cmath>
 #include <algorithm>
-#include <array>
+#include <vector>
 #include <tuple>
 #include <utility>
 
+//------------------------------------------------------------------------------
+// Helper: make_array
+// Deduces the size of a std::array from its initializer list (pre-C++20).
+//------------------------------------------------------------------------------
+template <typename T, typename... Ts>
+constexpr std::array<typename std::common_type<T, Ts...>::type, 1 + sizeof...(Ts)>
+make_array(T t, Ts... ts) {
+    return { t, ts... };
+}
+
 namespace project {
 
-    //--------------------------------------------------------------------------
-    // Macros to simplify configuration type definitions.
-    //--------------------------------------------------------------------------
-#define DEFINE_LFO_CONFIG_TYPE(name, freq) \
-    struct name { \
-        static constexpr float frequency = freq; \
-    }
+    //==============================================================================
+    // Configuration for the Reverb Network
+    //==============================================================================
+    // Define your reverb here 
 
-#define DEFINE_STAGE_CONFIG_TYPE(name, baseDelay, maxDelay, coeff, dep, lfoIdx) \
-    struct name { \
-        static constexpr float baseDelayMs = baseDelay; \
-        static constexpr float maxDelayMs = maxDelay; \
-        static constexpr float coefficient = coeff; \
-        static constexpr float depth = dep; \
-        static constexpr size_t lfoIndex = lfoIdx; \
-    }
+    struct GriffinReverbConfig {
+        // LFO speeds (in Hz)
+        inline static constexpr auto lfoFrequencies = make_array(1.5f);
 
-//--------------------------------------------------------------------------
-// LFOCustom: A compile-time LFO class parameterized by a config type.
-//--------------------------------------------------------------------------
-    template <typename Config>
-    class LFOCustom {
+        // Each stage is defined by its parameters.
+        // The maximum delay is computed automatically as baseDelay + 50.
+        struct Stage {
+            float baseDelay;
+            float coefficient;
+            float depth;
+            size_t lfoIndex;
+            constexpr float maxDelay() const { return baseDelay + 50.f; }
+        };
+
+        // List your stages here. 
+        inline static constexpr auto stages = make_array(
+            Stage{ 10.f, 0.5f, 0.3f, 0 }
+
+        );
+    };
+
+    //==============================================================================
+    // Simple LFO Class
+    //==============================================================================
+    class SimpleLFO {
     public:
-        LFOCustom() : phase(0.f), sampleRate(44100.f) {}
+        SimpleLFO() : frequency(1.f), phase(0.f), sampleRate(44100.f), increment(0.f) {}
+        SimpleLFO(float freq) : frequency(freq), phase(0.f), sampleRate(44100.f), increment(0.f) {}
+
         void prepare(float sr) {
             sampleRate = sr;
             phase = 0.f;
-            increment = Config::frequency / sampleRate;
+            increment = frequency / sampleRate;
         }
-        inline float update() {
+        float update() {
             phase += increment;
             if (phase >= 1.f)
                 phase -= 1.f;
             return parSin(phase);
         }
     private:
+        float frequency;
         float phase;
-        float increment;
         float sampleRate;
+        float increment;
         inline float parSin(float ph) const {
             float shifted = 0.5f - ph;
             return shifted * (8.f - 16.f * std::fabs(shifted));
         }
     };
 
-    //--------------------------------------------------------------------------
-    // AllpassDelayLineCustom: A compile-time allpass delay line class
-    // parameterized by a stage config type.
-    //--------------------------------------------------------------------------
-    template <typename Config>
-    class AllpassDelayLineCustom {
+    //==============================================================================
+    // Simple Allpass Delay Line Class
+    //==============================================================================
+    class SimpleAllpass {
     public:
-        static constexpr float baseDelayMs = Config::baseDelayMs;
-        static constexpr float maxDelayMs = Config::maxDelayMs;
-        static constexpr float coefficient = Config::coefficient;
-        static constexpr float depth = Config::depth;
-        static constexpr size_t lfoIndex = Config::lfoIndex;
-
-        AllpassDelayLineCustom()
-            : sampleRate(44100.f),
-            smoothedDelay(Config::baseDelayMs),
-            smoothedCoeff(Config::coefficient),
-            writeIndex(0),
-            factorDelay(44.1f),
-            powerBufferSize(0),
-            indexMask(0)
+        // Default constructor
+        SimpleAllpass()
+            : baseDelayMs(0.f), maxDelayMs(50.f), coefficient(0.f), depth(0.f), lfoIndex(0),
+            sampleRate(44100.f), smoothedDelay(0.f), smoothedCoeff(0.f), writeIndex(0),
+            factorDelay(0.f), powerBufferSize(0), indexMask(0)
         {
         }
+        // Parameterized constructor.
+        SimpleAllpass(float baseDelay, float coeff, float d, size_t lfoIdx)
+            : baseDelayMs(baseDelay), coefficient(coeff), depth(d), lfoIndex(lfoIdx),
+            sampleRate(44100.f), writeIndex(0)
+        {
+            maxDelayMs = baseDelayMs + 50.f;
+            smoothedDelay = baseDelayMs;
+            smoothedCoeff = coefficient;
+        }
+
         void prepare(float sr) {
             sampleRate = sr;
-            smoothedDelay = Config::baseDelayMs;
-            smoothedCoeff = Config::coefficient;
+            smoothedDelay = baseDelayMs;
+            smoothedCoeff = coefficient;
             writeIndex = 0;
             factorDelay = sampleRate / 1000.f;
-            int reqSize = static_cast<int>(std::ceil(Config::maxDelayMs * factorDelay)) + 4;
+            int reqSize = static_cast<int>(std::ceil(maxDelayMs * factorDelay)) + 4;
             powerBufferSize = nextPow2(reqSize);
             indexMask = powerBufferSize - 1;
-            delayBuffer.resize(powerBufferSize, 0.f);
+            delayBuffer.assign(powerBufferSize, 0.f);
         }
         void reset() {
             std::fill(delayBuffer.begin(), delayBuffer.end(), 0.f);
             writeIndex = 0;
-            smoothedDelay = Config::baseDelayMs;
-            smoothedCoeff = Config::coefficient;
+            smoothedDelay = baseDelayMs;
+            smoothedCoeff = coefficient;
         }
-        inline float processSample(float x, float lfoValue) {
-            float targetCoeff = Config::coefficient + Config::depth * lfoValue;
-            targetCoeff = (targetCoeff < -0.99f) ? -0.99f : ((targetCoeff > 0.99f) ? 0.99f : targetCoeff);
-            static const float smoothingFactor = 0.01f;
+        float processSample(float x, float lfoValue) {
+            float targetCoeff = coefficient + depth * lfoValue;
+            targetCoeff = std::clamp(targetCoeff, -0.99f, 0.99f);
+            constexpr float smoothingFactor = 0.01f;
             float oneMinusSmooth = 1.f - smoothingFactor;
             smoothedCoeff = oneMinusSmooth * smoothedCoeff + smoothingFactor * targetCoeff;
-            smoothedDelay = oneMinusSmooth * smoothedDelay + smoothingFactor * Config::baseDelayMs;
+            smoothedDelay = oneMinusSmooth * smoothedDelay + smoothingFactor * baseDelayMs;
 
             float D = smoothedDelay * factorDelay;
             int d_int = static_cast<int>(D);
@@ -119,6 +139,7 @@ namespace project {
             writeIndex = (writeIndex + 1) & indexMask;
             return y;
         }
+        size_t getLfoIndex() const { return lfoIndex; }
     private:
         static int nextPow2(int x) {
             x--;
@@ -129,6 +150,11 @@ namespace project {
             x |= x >> 16;
             return x + 1;
         }
+        float baseDelayMs;
+        float maxDelayMs;
+        float coefficient;
+        float depth;
+        size_t lfoIndex;
         float sampleRate;
         float smoothedDelay;
         float smoothedCoeff;
@@ -139,86 +165,69 @@ namespace project {
         int indexMask;
     };
 
-    //--------------------------------------------------------------------------
-    // Helper structures to group configuration packs into single types.
-    //--------------------------------------------------------------------------
-    template <typename... LFOConfigTypes>
-    struct LFOConfigs {
-        using tuple_type = std::tuple<LFOCustom<LFOConfigTypes>...>;
-    };
-
-    template <typename... StageConfigTypes>
-    struct StageConfigs {
-        using tuple_type = std::tuple<AllpassDelayLineCustom<StageConfigTypes>...>;
-    };
-
-    //--------------------------------------------------------------------------
-    // ModularReverbCustom: A compile-time reverb that chains together an
-    // arbitrary number of stages and LFOs. It takes two type parameters:
-    // one for LFO configurations and one for stage configurations.
-    //--------------------------------------------------------------------------
-    template <typename LFOConfigPack, typename StageConfigPack>
-    class ModularReverbCustom {
+    //==============================================================================
+    // ModularReverb: Builds the reverb chain from the configuration.
+    //==============================================================================
+    // The number of LFOs and stages is deduced automatically from the sizes of the constexpr arrays.
+    template <typename Config>
+    class ModularReverb {
     public:
-        using lfo_tuple_type = typename LFOConfigPack::tuple_type;
-        using stage_tuple_type = typename StageConfigPack::tuple_type;
-        static constexpr size_t numLFOs = std::tuple_size<lfo_tuple_type>::value;
-        static constexpr size_t numStages = std::tuple_size<stage_tuple_type>::value;
+        static constexpr size_t numLFOs = std::tuple_size<decltype(Config::lfoFrequencies)>::value;
+        static constexpr size_t numStages = std::tuple_size<decltype(Config::stages)>::value;
 
-        ModularReverbCustom() : sampleRate(44100.f) {}
+        ModularReverb()
+            : lfos(), aps()
+        {
+            // Allocate fixed-size arrays for LFOs and stages.
+            lfos.resize(numLFOs);
+            aps.resize(numStages);
+            // Initialize LFOs from the configuration.
+            for (size_t i = 0; i < numLFOs; ++i)
+                lfos[i] = SimpleLFO(Config::lfoFrequencies[i]);
+            // Initialize allpass stages from the configuration.
+            for (size_t i = 0; i < numStages; ++i) {
+                const auto& s = Config::stages[i];
+                aps[i] = SimpleAllpass(s.baseDelay, s.coefficient, s.depth, s.lfoIndex);
+            }
+        }
 
         void prepare(float sr) {
-            sampleRate = sr;
-            std::apply([&](auto&... lfo) { ((lfo.prepare(sr)), ...); }, lfos);
-            std::apply([&](auto&... stage) { ((stage.prepare(sr)), ...); }, stages);
+            for (auto& lfo : lfos)
+                lfo.prepare(sr);
+            for (auto& ap : aps)
+                ap.prepare(sr);
         }
         void reset() {
-            std::apply([&](auto&... stage) { ((stage.reset()), ...); }, stages);
+            for (auto& ap : aps)
+                ap.reset();
         }
-        inline float processSample(float x) {
+        float processSample(float x) {
             std::array<float, numLFOs> lfoValues;
-            updateLFOs(lfoValues, std::make_index_sequence<numLFOs>());
-            return processStages(x, lfoValues, std::make_index_sequence<numStages>());
-        }
-    private:
-        float sampleRate;
-        lfo_tuple_type lfos;
-        stage_tuple_type stages;
-
-        template <std::size_t... Is>
-        void updateLFOs(std::array<float, numLFOs>& values, std::index_sequence<Is...>) {
-            ((values[Is] = std::get<Is>(lfos).update()), ...);
-        }
-
-        template <std::size_t I>
-        static constexpr size_t getStageLFOIndex() {
-            using stage_type = typename std::tuple_element<I, stage_tuple_type>::type;
-            return stage_type::lfoIndex;
-        }
-
-        template <std::size_t... Is>
-        float processStages(float input, const std::array<float, numLFOs>& lfoValues, std::index_sequence<Is...>) {
-            float output = input;
-            ((output = std::get<Is>(stages).processSample(output, lfoValues[getStageLFOIndex<Is>()])), ...);
+            for (size_t i = 0; i < numLFOs; ++i)
+                lfoValues[i] = lfos[i].update();
+            float output = x;
+            for (size_t i = 0; i < numStages; ++i) {
+                size_t idx = aps[i].getLfoIndex();
+                if (idx >= numLFOs)
+                    idx = 0;
+                output = aps[i].processSample(output, lfoValues[idx]);
+            }
             return output;
         }
+    private:
+        std::vector<SimpleLFO> lfos;
+        std::vector<SimpleAllpass> aps;
     };
 
-    //--------------------------------------------------------------------------
+    //==============================================================================
     // Griffin_Reverb Node Definition
-    //--------------------------------------------------------------------------
-
-    // Define configuration types using the new macros.
-    DEFINE_LFO_CONFIG_TYPE(MyLFO1, 1.9128f);
-    DEFINE_STAGE_CONFIG_TYPE(MyStage1, 10.f, 50.f, 0.5f, 0.3f, 0);
-
+    //==============================================================================
+    // This node class remains part of your framework. Do not change the SNEX macros.
     template <int NV>
     struct Griffin_Reverb : public data::base {
         SNEX_NODE(Griffin_Reverb);
 
-        struct MetadataClass {
-            SN_NODE_ID("Griffin_Reverb");
-        };
+        struct MetadataClass { SN_NODE_ID("Griffin_Reverb"); };
 
         static constexpr bool isModNode() { return false; }
         static constexpr bool isPolyphonic() { return NV > 1; }
@@ -232,30 +241,24 @@ namespace project {
         static constexpr int NumFilters = 0;
         static constexpr int NumDisplayBuffers = 0;
 
-        // AudioReverb class replacing the old AudioEffect.
+        // AudioReverb: A wrapper that connects the reverb chain to the node.
         class AudioReverb {
         public:
-            AudioReverb() : sampleRate(44100.f) {}
-
+            AudioReverb() : sampleRate(44100.f), reverb() {} // Default construct ModularReverb
             void prepare(double sr) {
                 sampleRate = sr;
                 reverb.prepare(static_cast<float>(sampleRate));
             }
-
+            inline float processSample(float x) { return reverb.processSample(x); }
             inline void process(float* samples, int numSamples) {
                 for (int i = 0; i < numSamples; ++i)
                     samples[i] = reverb.processSample(samples[i]);
             }
-
-            void reset() {
-                reverb.reset();
-            }
+            void reset() { reverb.reset(); }
         private:
             double sampleRate;
-            // Instantiate the ModularReverbCustom with our configuration packs.
-            using MyLFOConfigs = LFOConfigs<MyLFO1>;
-            using MyStageConfigs = StageConfigs<MyStage1>;
-            ModularReverbCustom<MyLFOConfigs, MyStageConfigs> reverb;
+            // Use our central configuration (GriffinReverbConfig).
+            ModularReverb<GriffinReverbConfig> reverb;
         };
 
         AudioReverb monoReverb;
@@ -266,11 +269,7 @@ namespace project {
             monoReverb.prepare(sampleRate);
             monoBuffer.resize(static_cast<size_t>(specs.blockSize));
         }
-
-        void reset() {
-            monoReverb.reset();
-        }
-
+        void reset() { monoReverb.reset(); }
         template <typename ProcessDataType>
         void process(ProcessDataType& data) {
             auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
@@ -278,17 +277,14 @@ namespace project {
             auto* leftChannelData = audioBlock.getChannelPointer(0);
             auto* rightChannelData = audioBlock.getChannelPointer(1);
             int blockSize = data.getNumSamples();
-
             FloatVectorOperations::copy(monoBuffer.data(), leftChannelData, blockSize);
             FloatVectorOperations::add(monoBuffer.data(), rightChannelData, blockSize);
             FloatVectorOperations::multiply(monoBuffer.data(), 0.5f, blockSize);
-
-            monoReverb.process(monoBuffer.data(), blockSize);
-
+            for (int i = 0; i < blockSize; ++i)
+                monoBuffer[i] = monoReverb.processSample(monoBuffer[i]);
             FloatVectorOperations::copy(leftChannelData, monoBuffer.data(), blockSize);
             FloatVectorOperations::copy(rightChannelData, monoBuffer.data(), blockSize);
         }
-
         void createParameters(ParameterDataList& data) {}
         void handleHiseEvent(HiseEvent& e) {}
         template <typename FrameDataType>
