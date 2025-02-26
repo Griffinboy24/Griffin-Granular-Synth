@@ -7,6 +7,15 @@
 #include <tuple>
 #include <utility>
 
+// Fallback definition for JUCE_FORCEINLINE if not already defined.
+#ifndef JUCE_FORCEINLINE
+#if defined(_MSC_VER)
+#define JUCE_FORCEINLINE __forceinline
+#else
+#define JUCE_FORCEINLINE inline __attribute__((always_inline))
+#endif
+#endif
+
 //------------------------------------------------------------------------------
 // Helper: make_array
 // Deduces the size of a std::array from its initializer list (pre-C++20).
@@ -41,7 +50,6 @@ namespace project {
         // List your stages here. 
         inline static constexpr auto stages = make_array(
             Stage{ 10.f, 0.5f, 0.3f, 0 }
-
         );
     };
 
@@ -58,7 +66,7 @@ namespace project {
             phase = 0.f;
             increment = frequency / sampleRate;
         }
-        float update() {
+        JUCE_FORCEINLINE float update() {
             phase += increment;
             if (phase >= 1.f)
                 phase -= 1.f;
@@ -69,7 +77,7 @@ namespace project {
         float phase;
         float sampleRate;
         float increment;
-        inline float parSin(float ph) const {
+        JUCE_FORCEINLINE float parSin(float ph) const {
             float shifted = 0.5f - ph;
             return shifted * (8.f - 16.f * std::fabs(shifted));
         }
@@ -114,7 +122,7 @@ namespace project {
             smoothedDelay = baseDelayMs;
             smoothedCoeff = coefficient;
         }
-        float processSample(float x, float lfoValue) {
+        JUCE_FORCEINLINE float processSample(float x, float lfoValue) {
             float targetCoeff = coefficient + depth * lfoValue;
             targetCoeff = std::clamp(targetCoeff, -0.99f, 0.99f);
             constexpr float smoothingFactor = 0.01f;
@@ -175,12 +183,7 @@ namespace project {
         static constexpr size_t numLFOs = std::tuple_size<decltype(Config::lfoFrequencies)>::value;
         static constexpr size_t numStages = std::tuple_size<decltype(Config::stages)>::value;
 
-        ModularReverb()
-            : lfos(), aps()
-        {
-            // Allocate fixed-size arrays for LFOs and stages.
-            lfos.resize(numLFOs);
-            aps.resize(numStages);
+        ModularReverb() {
             // Initialize LFOs from the configuration.
             for (size_t i = 0; i < numLFOs; ++i)
                 lfos[i] = SimpleLFO(Config::lfoFrequencies[i]);
@@ -201,7 +204,7 @@ namespace project {
             for (auto& ap : aps)
                 ap.reset();
         }
-        float processSample(float x) {
+        JUCE_FORCEINLINE float processSample(float x) {
             std::array<float, numLFOs> lfoValues;
             for (size_t i = 0; i < numLFOs; ++i)
                 lfoValues[i] = lfos[i].update();
@@ -215,8 +218,8 @@ namespace project {
             return output;
         }
     private:
-        std::vector<SimpleLFO> lfos;
-        std::vector<SimpleAllpass> aps;
+        std::array<SimpleLFO, numLFOs> lfos;
+        std::array<SimpleAllpass, numStages> aps;
     };
 
     //==============================================================================
@@ -249,7 +252,7 @@ namespace project {
                 sampleRate = sr;
                 reverb.prepare(static_cast<float>(sampleRate));
             }
-            inline float processSample(float x) { return reverb.processSample(x); }
+            JUCE_FORCEINLINE float processSample(float x) { return reverb.processSample(x); }
             inline void process(float* samples, int numSamples) {
                 for (int i = 0; i < numSamples; ++i)
                     samples[i] = reverb.processSample(samples[i]);
