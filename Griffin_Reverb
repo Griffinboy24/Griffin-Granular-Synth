@@ -6,11 +6,15 @@
 #include <vector>
 #include <tuple>
 #include <utility>
-#include <memory>
-#include <string_view>
-#include <cstdlib>
-#include <cctype>
-#include <functional>
+
+// Fallback definition for JUCE_FORCEINLINE if not already defined.
+#ifndef JUCE_FORCEINLINE
+#if defined(_MSC_VER)
+#define JUCE_FORCEINLINE __forceinline
+#else
+#define JUCE_FORCEINLINE inline __attribute__((always_inline))
+#endif
+#endif
 
 //------------------------------------------------------------------------------
 // Helper: make_array
@@ -22,407 +26,205 @@ make_array(T t, Ts... ts) {
     return { t, ts... };
 }
 
-//------------------------------------------------------------------------------
-// DSL Macros for Reverb Configuration
-//------------------------------------------------------------------------------
-#define REVERB_CONFIG_BEGIN(name) \
-    struct name##Config { \
-        struct AllpassConfig { float baseDelay; float coefficient; float depth; size_t lfoIndex; }; \
-        struct StageChain { const AllpassConfig* allpasses; size_t numAllpasses; };
+namespace project {
 
-#define REVERB_CONFIG_LFO(...) \
-        inline static const auto lfoFrequencies = make_array(__VA_ARGS__);
+    //==============================================================================
+    // Configuration for the Reverb Network
+    //==============================================================================
+    // Define your reverb here 
 
-#define REVERB_CONFIG_STAGE(name, ...) \
-        inline static const auto name = make_array(__VA_ARGS__);
+    struct GriffinReverbConfig {
+        // LFO speeds (in Hz)
+        inline static constexpr auto lfoFrequencies = make_array(1.5f);
 
-#define STAGE_ENTRY(stage) StageChain{ stage.data(), stage.size() }
+        // Each AP (allpass) is defined by its parameters.
+        // The maximum delay is computed automatically as baseDelay + 50.
+        struct AP {
+            float baseDelay;
+            float coefficient;
+            float depth;
+            size_t lfoIndex;
+            constexpr float maxDelay() const { return baseDelay + 50.f; }
+        };
 
-#define REVERB_CONFIG_STAGES(...) \
-        inline static const auto stages = make_array(__VA_ARGS__);
-
-#define REVERB_CONFIG_ROUTING(expr) \
-        inline static constexpr const char* routing = expr;
-
-#define REVERB_CONFIG_END(name) \
+        // List your APs here. 
+        inline static constexpr auto aps = make_array(
+            AP{ 10.f, 0.5f, 0.3f, 0 }
+        );
     };
 
-//------------------------------------------------------------------------------
-// DSL Configuration Block
-//------------------------------------------------------------------------------
-REVERB_CONFIG_BEGIN(GriffinReverb)
-REVERB_CONFIG_LFO(1.5f)
-REVERB_CONFIG_STAGE(stage0,
-    AllpassConfig{ 10.f, 0.5f, 0.3f, 0 }
-)
-REVERB_CONFIG_STAGE(stage1,
-    AllpassConfig{ 15.f, 0.5f, 0.2f, 0 }
-)
-REVERB_CONFIG_STAGES(
-    STAGE_ENTRY(stage0),
-    STAGE_ENTRY(stage1)
-)
-REVERB_CONFIG_ROUTING("Input >> (Stage(0) >> Stage(1)) >> Output")
-REVERB_CONFIG_END(GriffinReverb)
-
-
-//------------------------------------------------------------------------------
-// Simple LFO Class
-//------------------------------------------------------------------------------
-class SimpleLFO {
-public:
-    SimpleLFO() : frequency(1.f), phase(0.f), sampleRate(44100.f), increment(0.f) {}
-    SimpleLFO(float freq) : frequency(freq), phase(0.f), sampleRate(44100.f), increment(0.f) {}
-
-    void prepare(float sr) {
-        sampleRate = sr;
-        phase = 0.f;
-        increment = frequency / sampleRate;
-    }
-    inline float update() {
-        phase += increment;
-        if (phase >= 1.f)
-            phase -= 1.f;
-        return parSin(phase);
-    }
-private:
-    float frequency;
-    float phase;
-    float sampleRate;
-    float increment;
-    inline float parSin(float ph) const {
-        float shifted = 0.5f - ph;
-        return shifted * (8.f - 16.f * std::fabs(shifted));
-    }
-};
-
-//------------------------------------------------------------------------------
-// Simple Allpass Delay Line Class
-//------------------------------------------------------------------------------
-class SimpleAllpass {
-public:
-    SimpleAllpass()
-        : baseDelayMs(0.f), maxDelayMs(50.f), coefficient(0.f), depth(0.f), lfoIndex(0),
-        sampleRate(44100.f), smoothedDelay(0.f), smoothedCoeff(0.f), writeIndex(0),
-        factorDelay(0.f), powerBufferSize(0), indexMask(0)
-    {
-    }
-    SimpleAllpass(float baseDelay, float coeff, float d, size_t lfoIdx)
-        : baseDelayMs(baseDelay), coefficient(coeff), depth(d), lfoIndex(lfoIdx),
-        sampleRate(44100.f), writeIndex(0)
-    {
-        maxDelayMs = baseDelayMs + 50.f;
-        smoothedDelay = baseDelayMs;
-        smoothedCoeff = coefficient;
-    }
-
-    void prepare(float sr) {
-        sampleRate = sr;
-        smoothedDelay = baseDelayMs;
-        smoothedCoeff = coefficient;
-        writeIndex = 0;
-        factorDelay = sampleRate / 1000.f;
-        int reqSize = static_cast<int>(std::ceil(maxDelayMs * factorDelay)) + 4;
-        powerBufferSize = nextPow2(reqSize);
-        indexMask = powerBufferSize - 1;
-        delayBuffer.assign(powerBufferSize, 0.f);
-    }
-    void reset() {
-        std::fill(delayBuffer.begin(), delayBuffer.end(), 0.f);
-        writeIndex = 0;
-        smoothedDelay = baseDelayMs;
-        smoothedCoeff = coefficient;
-    }
-    inline float processSample(float x, float lfoValue) {
-        float targetCoeff = coefficient + depth * lfoValue;
-        targetCoeff = std::clamp(targetCoeff, -0.99f, 0.99f);
-        constexpr float smoothingFactor = 0.01f;
-        float oneMinusSmooth = 1.f - smoothingFactor;
-        smoothedCoeff = oneMinusSmooth * smoothedCoeff + smoothingFactor * targetCoeff;
-        smoothedDelay = oneMinusSmooth * smoothedDelay + smoothingFactor * baseDelayMs;
-
-        float D = smoothedDelay * factorDelay;
-        int d_int = static_cast<int>(D);
-        float d_frac = D - static_cast<float>(d_int);
-        bool hasFraction = (d_frac > 0.f);
-        int offset = hasFraction ? 1 : 0;
-        int index0 = (writeIndex - d_int - offset) & indexMask;
-        float frac = hasFraction ? (1.f - d_frac) : 0.f;
-        int index1 = (index0 + 1) & indexMask;
-        float delayedV = (1.f - frac) * delayBuffer[index0] + frac * delayBuffer[index1];
-
-        float v = x - smoothedCoeff * delayedV;
-        float y = smoothedCoeff * v + delayedV;
-
-        delayBuffer[writeIndex] = v;
-        writeIndex = (writeIndex + 1) & indexMask;
-        return y;
-    }
-    size_t getLfoIndex() const { return lfoIndex; }
-private:
-    static int nextPow2(int x) {
-        x--;
-        x |= x >> 1;
-        x |= x >> 2;
-        x |= x >> 4;
-        x |= x >> 8;
-        x |= x >> 16;
-        return x + 1;
-    }
-    float baseDelayMs;
-    float maxDelayMs;
-    float coefficient;
-    float depth;
-    size_t lfoIndex;
-    float sampleRate;
-    float smoothedDelay;
-    float smoothedCoeff;
-    std::vector<float> delayBuffer;
-    int writeIndex;
-    float factorDelay;
-    int powerBufferSize;
-    int indexMask;
-};
-
-//------------------------------------------------------------------------------
-// ModularReverb: Builds the reverb chain from the configuration.
-//------------------------------------------------------------------------------
-template <typename Config>
-class ModularReverb {
-public:
-    static constexpr size_t numLFOs = std::tuple_size<decltype(Config::lfoFrequencies)>::value;
-    static constexpr size_t numStages = std::tuple_size<decltype(Config::stages)>::value;
-
-    ModularReverb() {
-        // Instantiate LFOs.
-        for (size_t i = 0; i < numLFOs; ++i)
-            lfos[i] = SimpleLFO(Config::lfoFrequencies[i]);
-
-        // Build stage processors from the DSL-defined stages.
-        for (size_t i = 0; i < numStages; ++i) {
-            const auto& sc = Config::stages[i];
-            StageChainProcessor proc;
-            for (size_t j = 0; j < sc.numAllpasses; ++j) {
-                const auto& apc = sc.allpasses[j];
-                proc.chain.push_back(SimpleAllpass(apc.baseDelay, apc.coefficient, apc.depth, apc.lfoIndex));
-            }
-            stageProcessors.push_back(std::move(proc));
-        }
-        // Parse routing expression from the DSL.
-        routingGraph = parseRouting(Config::routing);
-    }
-
-    void prepare(float sr) {
-        for (auto& lfo : lfos)
-            lfo.prepare(sr);
-        for (auto& proc : stageProcessors)
-            proc.prepare(sr);
-        if (routingGraph)
-            routingGraph->reset();
-    }
-    void reset() {
-        for (auto& proc : stageProcessors)
-            proc.reset();
-        if (routingGraph)
-            routingGraph->reset();
-    }
-    inline float processSample(float x) {
-        std::array<float, numLFOs> lfoValues;
-        for (size_t i = 0; i < numLFOs; ++i)
-            lfoValues[i] = lfos[i].update();
-        return routingGraph ? routingGraph->process(x, lfoValues) : x;
-    }
-private:
-    //--------------------------------------------------------------------------
-    // StageChainProcessor: Processes a chain of allpass filters.
-    //--------------------------------------------------------------------------
-    class StageChainProcessor {
+    //==============================================================================
+    // Simple LFO Class
+    //==============================================================================
+    class SimpleLFO {
     public:
-        std::vector<SimpleAllpass> chain;
+        SimpleLFO() : frequency(1.f), phase(0.f), sampleRate(44100.f), increment(0.f) {}
+        SimpleLFO(float freq) : frequency(freq), phase(0.f), sampleRate(44100.f), increment(0.f) {}
+
         void prepare(float sr) {
-            for (auto& ap : chain)
+            sampleRate = sr;
+            phase = 0.f;
+            increment = frequency / sampleRate;
+        }
+        JUCE_FORCEINLINE float update() {
+            phase += increment;
+            if (phase >= 1.f)
+                phase -= 1.f;
+            return parSin(phase);
+        }
+    private:
+        float frequency;
+        float phase;
+        float sampleRate;
+        float increment;
+        JUCE_FORCEINLINE float parSin(float ph) const {
+            float shifted = 0.5f - ph;
+            return shifted * (8.f - 16.f * std::fabs(shifted));
+        }
+    };
+
+    //==============================================================================
+    // Simple Allpass Delay Line Class (renamed to SimpleAP)
+    //==============================================================================
+    class SimpleAP {
+    public:
+        // Default constructor
+        SimpleAP()
+            : baseDelayMs(0.f), maxDelayMs(50.f), coefficient(0.f), depth(0.f), lfoIndex(0),
+            sampleRate(44100.f), smoothedDelay(0.f), smoothedCoeff(0.f), writeIndex(0),
+            factorDelay(0.f), powerBufferSize(0), indexMask(0)
+        {
+        }
+        // Parameterized constructor.
+        SimpleAP(float baseDelay, float coeff, float d, size_t lfoIdx)
+            : baseDelayMs(baseDelay), coefficient(coeff), depth(d), lfoIndex(lfoIdx),
+            sampleRate(44100.f), writeIndex(0)
+        {
+            maxDelayMs = baseDelayMs + 50.f;
+            smoothedDelay = baseDelayMs;
+            smoothedCoeff = coefficient;
+        }
+
+        void prepare(float sr) {
+            sampleRate = sr;
+            smoothedDelay = baseDelayMs;
+            smoothedCoeff = coefficient;
+            writeIndex = 0;
+            factorDelay = sampleRate / 1000.f;
+            int reqSize = static_cast<int>(std::ceil(maxDelayMs * factorDelay)) + 4;
+            powerBufferSize = nextPow2(reqSize);
+            indexMask = powerBufferSize - 1;
+            delayBuffer.assign(powerBufferSize, 0.f);
+        }
+        void reset() {
+            std::fill(delayBuffer.begin(), delayBuffer.end(), 0.f);
+            writeIndex = 0;
+            smoothedDelay = baseDelayMs;
+            smoothedCoeff = coefficient;
+        }
+        JUCE_FORCEINLINE float processSample(float x, float lfoValue) {
+            float targetCoeff = coefficient + depth * lfoValue;
+            targetCoeff = std::clamp(targetCoeff, -0.99f, 0.99f);
+            constexpr float smoothingFactor = 0.01f;
+            float oneMinusSmooth = 1.f - smoothingFactor;
+            smoothedCoeff = oneMinusSmooth * smoothedCoeff + smoothingFactor * targetCoeff;
+            smoothedDelay = oneMinusSmooth * smoothedDelay + smoothingFactor * baseDelayMs;
+
+            float D = smoothedDelay * factorDelay;
+            int d_int = static_cast<int>(D);
+            float d_frac = D - static_cast<float>(d_int);
+            bool hasFraction = (d_frac > 0.f);
+            int offset = hasFraction ? 1 : 0;
+            int index0 = (writeIndex - d_int - offset) & indexMask;
+            float frac = hasFraction ? (1.f - d_frac) : 0.f;
+            int index1 = (index0 + 1) & indexMask;
+            float delayedV = (1.f - frac) * delayBuffer[index0] + frac * delayBuffer[index1];
+
+            float v = x - smoothedCoeff * delayedV;
+            float y = smoothedCoeff * v + delayedV;
+
+            delayBuffer[writeIndex] = v;
+            writeIndex = (writeIndex + 1) & indexMask;
+            return y;
+        }
+        size_t getLfoIndex() const { return lfoIndex; }
+    private:
+        static int nextPow2(int x) {
+            x--;
+            x |= x >> 1;
+            x |= x >> 2;
+            x |= x >> 4;
+            x |= x >> 8;
+            x |= x >> 16;
+            return x + 1;
+        }
+        float baseDelayMs;
+        float maxDelayMs;
+        float coefficient;
+        float depth;
+        size_t lfoIndex;
+        float sampleRate;
+        float smoothedDelay;
+        float smoothedCoeff;
+        std::vector<float> delayBuffer;
+        int writeIndex;
+        float factorDelay;
+        int powerBufferSize;
+        int indexMask;
+    };
+
+    //==============================================================================
+    // ModularReverb: Builds the reverb chain from the configuration.
+    // The number of LFOs and APs is deduced automatically from the sizes of the constexpr arrays.
+    template <typename Config>
+    class ModularReverb {
+    public:
+        static constexpr size_t numLFOs = std::tuple_size<decltype(Config::lfoFrequencies)>::value;
+        static constexpr size_t numAPs = std::tuple_size<decltype(Config::aps)>::value;
+
+        ModularReverb() {
+            // Initialize LFOs from the configuration.
+            for (size_t i = 0; i < numLFOs; ++i)
+                lfos[i] = SimpleLFO(Config::lfoFrequencies[i]);
+            // Initialize APs from the configuration.
+            for (size_t i = 0; i < numAPs; ++i) {
+                const auto& s = Config::aps[i];
+                aps[i] = SimpleAP(s.baseDelay, s.coefficient, s.depth, s.lfoIndex);
+            }
+        }
+
+        void prepare(float sr) {
+            for (auto& lfo : lfos)
+                lfo.prepare(sr);
+            for (auto& ap : aps)
                 ap.prepare(sr);
         }
         void reset() {
-            for (auto& ap : chain)
+            for (auto& ap : aps)
                 ap.reset();
         }
-        float processSample(float x, const std::array<float, numLFOs>& lfoValues) {
-            float y = x;
-            for (auto& ap : chain) {
-                size_t idx = ap.getLfoIndex();
-                if (idx >= numLFOs) idx = 0;
-                y = ap.processSample(y, lfoValues[idx]);
+        JUCE_FORCEINLINE float processSample(float x) {
+            std::array<float, numLFOs> lfoValues;
+            for (size_t i = 0; i < numLFOs; ++i)
+                lfoValues[i] = lfos[i].update();
+            float output = x;
+            for (size_t i = 0; i < numAPs; ++i) {
+                size_t idx = aps[i].getLfoIndex();
+                if (idx >= numLFOs)
+                    idx = 0;
+                output = aps[i].processSample(output, lfoValues[idx]);
             }
-            return y;
-        }
-    };
-
-    std::array<SimpleLFO, numLFOs> lfos;
-    std::vector<StageChainProcessor> stageProcessors;
-
-    //--------------------------------------------------------------------------
-    // Processing Node Hierarchy for Routing
-    //--------------------------------------------------------------------------
-    class ProcessingNode {
-    public:
-        virtual ~ProcessingNode() = default;
-        virtual float process(float input, const std::array<float, numLFOs>& lfoValues) = 0;
-        virtual void reset() {}
-    };
-
-    class IdentityNode : public ProcessingNode {
-    public:
-        float process(float input, const std::array<float, numLFOs>&) override { return input; }
-    };
-
-    // StageNode now holds a pointer to a non-const vector to allow state modification.
-    class StageNode : public ProcessingNode {
-    public:
-        StageNode(size_t idx, std::vector<StageChainProcessor>* procs)
-            : stageIndex(idx), processors(procs) {
-        }
-        float process(float input, const std::array<float, numLFOs>& lfoValues) override {
-            if (stageIndex < processors->size())
-                return (*processors)[stageIndex].processSample(input, lfoValues);
-            return input;
+            return output;
         }
     private:
-        size_t stageIndex;
-        std::vector<StageChainProcessor>* processors;
+        std::array<SimpleLFO, numLFOs> lfos;
+        std::array<SimpleAP, numAPs> aps;
     };
 
-    class SerialNode : public ProcessingNode {
-    public:
-        void addNode(std::unique_ptr<ProcessingNode> node) {
-            nodes.push_back(std::move(node));
-        }
-        float process(float input, const std::array<float, numLFOs>& lfoValues) override {
-            float out = input;
-            for (auto& n : nodes)
-                out = n->process(out, lfoValues);
-            return out;
-        }
-        void reset() override {
-            for (auto& n : nodes)
-                n->reset();
-        }
-    private:
-        std::vector<std::unique_ptr<ProcessingNode>> nodes;
-    };
-
-    class ParallelNode : public ProcessingNode {
-    public:
-        void addNode(std::unique_ptr<ProcessingNode> node) {
-            nodes.push_back(std::move(node));
-        }
-        float process(float input, const std::array<float, numLFOs>& lfoValues) override {
-            float sum = 0.f;
-            for (auto& n : nodes)
-                sum += n->process(input, lfoValues);
-            return sum;
-        }
-        void reset() override {
-            for (auto& n : nodes)
-                n->reset();
-        }
-    private:
-        std::vector<std::unique_ptr<ProcessingNode>> nodes;
-    };
-
-    //--------------------------------------------------------------------------
-    // Routing Parser (simple recursive descent parser)
-    // Grammar:
-    //   Expr   -> Term { ">>" Term }
-    //   Term   -> Factor { "||" Factor }
-    //   Factor -> "Input" | "Output" | Stage | "(" Expr ")"
-    //   Stage  -> "Stage(" number ")"
-    //--------------------------------------------------------------------------
-    std::unique_ptr<ProcessingNode> parseRouting(const char* expr) {
-        std::string_view input(expr);
-        size_t pos = 0;
-        auto skipSpaces = [&]() {
-            while (pos < input.size() && std::isspace(static_cast<unsigned char>(input[pos])))
-                ++pos;
-            };
-        std::function<std::unique_ptr<ProcessingNode>()> parseExpr, parseTerm, parseFactor;
-
-        parseFactor = [&]() -> std::unique_ptr<ProcessingNode> {
-            skipSpaces();
-            if (pos >= input.size())
-                return std::make_unique<IdentityNode>();
-            if (input.substr(pos, 5) == "Input") {
-                pos += 5;
-                return std::make_unique<IdentityNode>();
-            }
-            if (input.substr(pos, 6) == "Output") {
-                pos += 6;
-                return std::make_unique<IdentityNode>();
-            }
-            if (input.substr(pos, 6) == "Stage(") {
-                pos += 6;
-                skipSpaces();
-                size_t start = pos;
-                while (pos < input.size() && std::isdigit(input[pos]))
-                    ++pos;
-                int stageNum = std::atoi(std::string(input.substr(start, pos - start)).c_str());
-                skipSpaces();
-                if (pos < input.size() && input[pos] == ')')
-                    ++pos;
-                return std::make_unique<StageNode>(static_cast<size_t>(stageNum), &stageProcessors);
-            }
-            if (input[pos] == '(') {
-                ++pos;
-                auto node = parseExpr();
-                skipSpaces();
-                if (pos < input.size() && input[pos] == ')')
-                    ++pos;
-                return node;
-            }
-            return std::make_unique<IdentityNode>();
-            };
-
-        parseTerm = [&]() -> std::unique_ptr<ProcessingNode> {
-            auto left = parseFactor();
-            skipSpaces();
-            while (input.substr(pos, 2) == "||") {
-                pos += 2;
-                auto right = parseFactor();
-                auto parNode = std::make_unique<ParallelNode>();
-                parNode->addNode(std::move(left));
-                parNode->addNode(std::move(right));
-                left = std::move(parNode);
-                skipSpaces();
-            }
-            return left;
-            };
-
-        parseExpr = [&]() -> std::unique_ptr<ProcessingNode> {
-            auto left = parseTerm();
-            skipSpaces();
-            while (input.substr(pos, 2) == ">>") {
-                pos += 2;
-                auto right = parseTerm();
-                auto serNode = std::make_unique<SerialNode>();
-                serNode->addNode(std::move(left));
-                serNode->addNode(std::move(right));
-                left = std::move(serNode);
-                skipSpaces();
-            }
-            return left;
-            };
-
-        return parseExpr();
-    }
-
-    std::unique_ptr<ProcessingNode> routingGraph;
-};
-
-//------------------------------------------------------------------------------
-// Griffin_Reverb Node Definition (do not change SNEX macros)
-//------------------------------------------------------------------------------
-namespace project {
-
+    //==============================================================================
+    // Griffin_Reverb Node Definition
+    //==============================================================================
+    // This node class remains part of your framework. Do not change the SNEX macros.
     template <int NV>
     struct Griffin_Reverb : public data::base {
         SNEX_NODE(Griffin_Reverb);
@@ -444,12 +246,12 @@ namespace project {
         // AudioReverb: A wrapper that connects the reverb chain to the node.
         class AudioReverb {
         public:
-            AudioReverb() : sampleRate(44100.f), reverb() {}
+            AudioReverb() : sampleRate(44100.f), reverb() {} // Default construct ModularReverb
             void prepare(double sr) {
                 sampleRate = sr;
                 reverb.prepare(static_cast<float>(sampleRate));
             }
-            inline float processSample(float x) { return reverb.processSample(x); }
+            JUCE_FORCEINLINE float processSample(float x) { return reverb.processSample(x); }
             inline void process(float* samples, int numSamples) {
                 for (int i = 0; i < numSamples; ++i)
                     samples[i] = reverb.processSample(samples[i]);
@@ -457,6 +259,7 @@ namespace project {
             void reset() { reverb.reset(); }
         private:
             double sampleRate;
+            // Use our central configuration (GriffinReverbConfig).
             ModularReverb<GriffinReverbConfig> reverb;
         };
 
