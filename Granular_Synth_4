@@ -35,7 +35,7 @@ namespace project
         float  panning = 0.0f;
         int    gapAdjustment = 0;
         float  sizeMult = 1.0f;
-        float  startOffsetInSamples = 0.0f;
+        float  startOffsetInSamples = 0.0f; // Renamed for clarity - represents the final calculated start offset
         bool   reverse = false;
     };
 
@@ -464,6 +464,7 @@ namespace project
         Grain(double dur, double d, const std::array<const float*, 2>& src, float amp,
             const GrainEssence& e, int bufferLength, EnvelopeMode envMode, bool isPunchy)
         {
+            // ... (Grain constructor - mostly no changes, except using e.startOffsetInSamples directly) ...
             duration = dur; delta = d;
             double centsFact = std::pow(2.0, (e.pitchOffsetCents / 1200.0));
             sourceReadLength = (d * centsFact) * dur;
@@ -494,7 +495,7 @@ namespace project
             }
             double incD = sourceReadLength * FIXED_ONE / durSamples;
             phaseInc = (int64_t)std::llround(incD);
-            float offset = e.startOffsetInSamples;
+            float offset = e.startOffsetInSamples; // Use the pre-calculated startOffsetInSamples from essence
             if (offset < 0.f) offset = 0.f;
             else if (offset > (float)(bufferLength - 1)) offset = (float)(bufferLength - 1);
             if (e.reverse)
@@ -656,10 +657,10 @@ namespace project
         int grainIntervalInSamples = 0;
         double globalPitchOffsetFactor = 1.0;
 
-        float  grainStartPercent = 0.0f;
-        float  grainStartOffsetInSamples = 0.0f;
-        float  grainInitialStartOffsetPercent = 0.0f;
-        float  initialStartOffsetInSamples = 0.0f;
+        float  sampleStartPercent = 0.0f;     // Renamed from grainStartPercent
+        float  sampleStartOffsetInSamples = 0.0f; // Renamed to sampleStartOffsetInSamples to match percent name
+        float  startOffsetPercent = 0.0f;     // Renamed from grainInitialStartOffsetPercent - Represents the relative offset within the scan range
+        float  startOffsetInSamples = 0.0f;     // Added - to hold the calculated sample offset based on startOffsetPercent
 
         float  scanEndPercent = 1.0f;
         double grainPitchOffsetSemitones = 0.0;
@@ -726,8 +727,8 @@ namespace project
             globalPitchOffsetFactor = grainPitchOffsetSemitones;
             int currentSampleLength = sampleBuffer.getNumSamples();
             if (currentSampleLength < 1) currentSampleLength = 1;
-            grainStartOffsetInSamples = grainStartPercent * float(currentSampleLength - 1);
-            initialStartOffsetInSamples = grainInitialStartOffsetPercent * float(currentSampleLength - 1);
+            sampleStartOffsetInSamples = sampleStartPercent * float(currentSampleLength - 1); // Calculate sample start offset
+            startOffsetInSamples = startOffsetPercent * float(currentSampleLength - 1); // Calculate start offset in samples (now relative to sample length for parameter update)
             raisedCosAttackSamples = (int)std::lround(0.02 * sampleRate);
             raisedCosReleaseSamples = (int)std::lround(0.02 * sampleRate);
         }
@@ -865,7 +866,13 @@ namespace project
                             essence.gapAdjustment = gapDist(randomGen);
                             std::uniform_real_distribution<float> sizeDist((1.f - grainSizeRandom), 1.f);
                             essence.sizeMult = sizeDist(randomGen);
-                            float finalStartOffset = initialStartOffsetInSamples;
+
+                            float sampleStartOffset = sampleStartPercent * float(sampleLen - 1);
+                            float scanEndOffset = scanEndPercent * float(sampleLen - 1);
+                            float scanRange = scanEndOffset - sampleStartOffset;
+
+                            float finalStartOffset = sampleStartOffset; // Start from Sample Start
+
                             if (startModEnabled && startModTimeSec > 0.00001)
                             {
                                 int samplesPassed = grainIntervalInSamples + essence.gapAdjustment;
@@ -884,9 +891,11 @@ namespace project
                                     voice.scanDirection = 1.0;
                                 }
                                 float curPercent = (float)voice.modPhase;
-                                float scanEndOffset = scanEndPercent * float(sampleLen - 1);
-                                finalStartOffset = initialStartOffsetInSamples + (scanEndOffset - initialStartOffsetInSamples) * curPercent;
+                                finalStartOffset += scanRange * curPercent; // Modulate within the scan range
                             }
+
+                            finalStartOffset += startOffsetPercent * scanRange; // Apply Start Offset as percentage of scan range
+
                             if (grainSpray > 0.f)
                             {
                                 std::uniform_real_distribution<float> rdist(0.f, 1.f);
@@ -942,7 +951,7 @@ namespace project
             else if constexpr (P == 6) { grainIntervalMS = v; updateDerivedParameters(); }
             else if constexpr (P == 7) { grainGapAdjustmentMaxSec = v; }
             else if constexpr (P == 8) { grainSizeRandom = (float)v; }
-            else if constexpr (P == 9) { grainStartPercent = (float)v; updateDerivedParameters(); }
+            else if constexpr (P == 9) { sampleStartPercent = (float)v; updateDerivedParameters(); } // Renamed parameter
             else if constexpr (P == 10) { scanEndPercent = (float)v; }
             else if constexpr (P == 11) { startModTimeSec = v; }
             else if constexpr (P == 12) { startModEnabled = (v >= 0.5); }
@@ -962,11 +971,12 @@ namespace project
             }
             else if constexpr (P == 16) { envelopeType = (int)std::round(v * 2.0f); }
             else if constexpr (P == 17) { reverseChance = (float)v; }
-            else if constexpr (P == 18) { grainInitialStartOffsetPercent = (float)v; updateDerivedParameters(); }
+            else if constexpr (P == 18) { startOffsetPercent = (float)v; updateDerivedParameters(); } // Renamed parameter and update derived params
         }
 
         void createParameters(ParameterDataList& data)
         {
+            // ... (Parameter creation - mostly renamed parameters) ...
             {
                 parameter::data pitchOffsetParam("Pitch (multiplier)", { 0.25, 4.0, 0.01 });
                 registerCallback<0>(pitchOffsetParam);
@@ -1022,10 +1032,10 @@ namespace project
                 data.add(std::move(sizeRandomParam));
             }
             {
-                parameter::data startParam("Sample Start", { 0.0, 1.0, 0.001 });
-                registerCallback<9>(startParam);
-                startParam.setDefaultValue(0.0);
-                data.add(std::move(startParam));
+                parameter::data sampleStartParam("Sample Start", { 0.0, 1.0, 0.001 }); // Renamed parameter
+                registerCallback<9>(sampleStartParam);
+                sampleStartParam.setDefaultValue(0.0);
+                data.add(std::move(sampleStartParam));
             }
             {
                 parameter::data scanEndParam("Scan End", { 0.0, 1.0, 0.001 });
@@ -1076,7 +1086,7 @@ namespace project
                 data.add(std::move(reverseChanceParam));
             }
             {
-                parameter::data startOffsetParam("Start Offset", { 0.0, 1.0, 0.001 });
+                parameter::data startOffsetParam("Start Offset", { 0.0, 1.0, 0.001 }); // Renamed parameter
                 registerCallback<18>(startOffsetParam);
                 startOffsetParam.setDefaultValue(0.0);
                 data.add(std::move(startOffsetParam));
