@@ -1,0 +1,263 @@
+/*
+Copyright (c) 2024 griffinboy
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+
+#pragma once
+#include <JuceHeader.h>
+
+namespace project
+{
+    using namespace juce;
+    using namespace hise;
+    using namespace scriptnode;
+
+    // ScopedValue: A utility class for RAII-style temporary modification of a value.
+    // It ensures a value is restored to its original state when it goes out of scope.
+    template <typename T>
+    class ScopedValue
+    {
+    public:
+        explicit ScopedValue(T& val) : value(val), ref(val) {}
+        ~ScopedValue() { ref = value; }
+        T& get() { return value; }
+
+    private:
+        T value;
+        T& ref;
+        ScopedValue(const ScopedValue&) = delete;
+        ScopedValue& operator=(const ScopedValue&) = delete;
+    };
+
+    // Griffin_LadderFilter: A HISE Script Node implementing a polyphonic Moog-style ladder filter.
+    template <int NV> // NV: Number of Voices
+    struct Griffin_LadderFilter : public data::base
+    {
+        SNEX_NODE(Griffin_LadderFilter); // Macro for HISE node registration.
+
+        // Metadata for identifying the node in HISE.
+        struct MetadataClass
+        {
+            SN_NODE_ID("Griffin_LadderFilter");
+        };
+
+        // Node properties essential for HISE (e.g., polyphony, channel count, etc.)
+        static constexpr bool isModNode() { return false; }
+        static constexpr bool isPolyphonic() { return NV > 1; }
+        static constexpr bool hasTail() { return false; }
+        static constexpr bool isSuspendedOnSilence() { return false; }
+        static constexpr int getFixChannelAmount() { return 2; }
+
+        // Constants for data types used by the node (currently not in use)
+        static constexpr int NumTables = 0;
+        static constexpr int NumSliderPacks = 0;
+        static constexpr int NumAudioFiles = 0;
+        static constexpr int NumFilters = 0;
+        static constexpr int NumDisplayBuffers = 0;
+
+        // prepare: Initializes the filter and its polyphonic instances.
+        // It's called once before audio processing begins to prepare the filter for use.
+        void prepare(PrepareSpecs specs)
+        {
+            filtersLeft.prepare(specs);
+            filtersRight.prepare(specs);
+
+            for (auto& filter : filtersLeft)
+                filter.prepare(specs.sampleRate);
+
+            for (auto& filter : filtersRight)
+                filter.prepare(specs.sampleRate);
+        }
+
+        // reset: Resets the filter state variables for all polyphonic instances.
+        // It's called to clear out any previous filter state before starting new processing.
+        void reset()
+        {
+            for (auto& filter : filtersLeft)
+                filter.reset();
+
+            for (auto& filter : filtersRight)
+                filter.reset();
+        }
+
+        // process: The main audio processing loop for the filter.
+         // It processes the audio data, passing it through each active filter instance.
+        template <typename ProcessDataType>
+        void process(ProcessDataType& data)
+        {
+            auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
+            auto audioBlock = fixData.toAudioBlock();
+
+            auto* leftChannelData = audioBlock.getChannelPointer(0);
+            auto* rightChannelData = audioBlock.getChannelPointer(1);
+            int numSamples = (int)data.getNumSamples();
+
+            for (auto& leftFilter : filtersLeft)
+            {
+                leftFilter.process(leftChannelData, numSamples);
+            }
+
+            for (auto& rightFilter : filtersRight)
+            {
+                rightFilter.process(rightChannelData, numSamples);
+            }
+        }
+
+        // AudioEffect: Class implementing a single instance of the Moog ladder filter.
+        // This class contains the core filtering algorithm.
+        class AudioEffect
+        {
+        public:
+            AudioEffect() = default;
+
+            void prepare(float sampleRate)
+            {
+                fs = sampleRate;
+                reset();
+            }
+
+            void reset()
+            {
+                s1 = s2 = s3 = s4 = 0.0f;
+            }
+
+            // updateCoefficients: Calculates and sets the filter coefficients based on cutoff and resonance.
+            // This method prepares the filter for the next processing cycle.
+            void updateCoefficients(float fc, float resonanceValue)
+            {
+                float fcClamped = std::clamp(fc, 20.0f, 0.49f * fs);
+                float g = std::tan(MathConstants<float>::pi * fcClamped / fs);
+                k = 4.0f * resonanceValue;
+                G = g / (1.0f + g);
+
+                float dbGain = quadratic_curve(resonanceValue, a, b, c);
+                gainCompensation = std::pow(10.0f, dbGain / 20.0f);
+            }
+
+            // process: Applies the filter to a buffer of audio samples.
+            inline void process(float* samples, int numSamples)
+            {
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    samples[i] = processSample(samples[i]);
+                }
+            }
+
+        private:
+            // Filter state variables and parameters.
+            float fs = 44100.0f;
+            float k = 0.0f;
+            float G = 0.0f;
+            float gainCompensation = 1.0f;
+            float s1 = 0.0f;
+            float s2 = 0.0f;
+            float s3 = 0.0f;
+            float s4 = 0.0f;
+            static constexpr float a = -8.0f;
+            static constexpr float b = 18.2f;
+            static constexpr float c = 1.5f;
+
+            // processSample: Applies the Moog ladder filter to a single sample.
+            // This is the core filter algorithm.
+            inline float processSample(float input)
+            {
+                float u = input - k * s4;
+                s1 = G * (u - s1) + s1;
+                s2 = G * (s1 - s2) + s2;
+                s3 = G * (s2 - s3) + s3;
+                s4 = G * (s3 - s4) + s4;
+                return s4 * gainCompensation;
+            }
+
+            // Helper function to generate a quadratic curve.
+            static float quadratic_curve(float x, float a, float b, float c)
+            {
+                return a * x * x + b * x + c;
+            }
+        };
+
+        // setParameter: Called when a parameter changes in HISE, updates filter parameters.
+        template <int P>
+        void setParameter(double value)
+        {
+            if (P == 0) // Cutoff Frequency
+            {
+                cutoffFrequency = static_cast<float>(value);
+                for (auto& filter : filtersLeft)
+                    filter.updateCoefficients(cutoffFrequency, resonance);
+
+                for (auto& filter : filtersRight)
+                    filter.updateCoefficients(cutoffFrequency, resonance);
+            }
+            else if (P == 1) // Resonance
+            {
+                resonance = static_cast<float>(value);
+                for (auto& filter : filtersLeft)
+                    filter.updateCoefficients(cutoffFrequency, resonance);
+
+                for (auto& filter : filtersRight)
+                    filter.updateCoefficients(cutoffFrequency, resonance);
+            }
+        }
+
+        // createParameters: Defines the filter's parameters for HISE.
+        void createParameters(ParameterDataList& data)
+        {
+            {
+                parameter::data p("Cutoff Frequency", { 20.0, 20000.0, 1.0 });
+                registerCallback<0>(p);
+                p.setDefaultValue(1000.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Resonance", { 0.0, 1.0, 0.01 });
+                registerCallback<1>(p);
+                p.setDefaultValue(0.0);
+                data.add(std::move(p));
+            }
+        }
+
+        // setExternalData: Not implemented in this filter, placeholder for external data input.
+        void setExternalData(const ExternalData& data, int index) {}
+
+		// handleHiseEvent: Handles incoming MIDI events.
+        void handleHiseEvent(HiseEvent& e)
+        {
+            if (e.isNoteOn())
+            {
+                //  e.getNoteNumber()
+            }
+        }
+
+        // processFrame: Necessary for HISE internal workings, not used by this filter.
+        template <typename FrameDataType>
+        void processFrame(FrameDataType& data) {}
+
+    private:
+        // Polyphonic filter instances for left and right audio channels.
+        PolyData<AudioEffect, NV> filtersLeft;
+        PolyData<AudioEffect, NV> filtersRight;
+
+        // Filter control parameters (cutoff frequency and resonance).
+        float cutoffFrequency = 1000.0f;
+        float resonance = 0.0f;
+    };
+}
