@@ -3,20 +3,19 @@
 
 /*
    ================================================================================
-   OB8-Tuned 2-SVF + Global Feedback Filter (DAFx-2020) with Block-Based Smoothing & CPU Optimization
+   OB8-Tuned 2-SVF + Global Feedback Filter with Sample-by-Sample Parameter
+   Updates & Optimized Closed-Form Matrix Inversion
 
    This implementation uses the exact delay-free state-space method from
    "Moog Ladder Filter Generalizations Based on State Variable Filters"
-   by Werner & McClellan, tuned for the OB8 filter:
-     - Fixed local damping r = 3.4f
-     - User "Resonance" in [0, 35] (OB8 tuning)
-     - Global feedback is applied with a negative sign (Moog-style) so that
-       the overall response matches the OB8 behavior.
+   (Werner & McClellan, DAFx-2020), tuned for the OB8:
+      - Fixed local damping r = 3.4f (OB8 tuning)
+      - "Resonance" (feedback) range is [0, 35.0]
+      - Global feedback sign is negative (i.e. Acont[0][3] = -kf)
 
-   To reduce CPU overhead, parameter smoothing is applied block-by-block:
-     - We use juce::dsp::SmoothedValue<float> to ramp cutoff, resonance,
-       and keytrack over ~10 ms.
-     - The matrix inversion is updated only once per block when parameters change.
+   To preserve accurate modulation and key tracking, parameters are updated
+   every sample. To mitigate the CPU load from matrix inversion, we use a
+   closed-form solution that exploits the structure of M = I - g*A.
 
    ================================================================================
 */
@@ -32,14 +31,11 @@ namespace project
     {
         SNEX_NODE(Griffin_OBFilter);
 
-        struct MetadataClass
-        {
-            SN_NODE_ID("Griffin_OBFilter");
-        };
+        struct MetadataClass { SN_NODE_ID("Griffin_OBFilter"); };
 
         static constexpr bool isModNode() { return false; }
         static constexpr bool isPolyphonic() { return NV > 1; }
-        static constexpr bool hasTail() { return true; }
+        static constexpr bool hasTail() { return false; }
         static constexpr bool isSuspendedOnSilence() { return false; }
         static constexpr int  getFixChannelAmount() { return 2; }
 
@@ -49,27 +45,20 @@ namespace project
         static constexpr int  NumFilters = 0;
         static constexpr int  NumDisplayBuffers = 0;
 
-        //-------------------------------------------------------------------------
-        // Parameter smoothing objects (block-based)
-        //-------------------------------------------------------------------------
-        SmoothedValue<float> cutoffSmooth;
-        SmoothedValue<float> resonanceSmooth;
-        SmoothedValue<float> keytrackSmooth;
-
-        // Raw parameter values
+        // Parameters (raw values)
         float cutoffFrequency = 1000.0f;
         float resonance = 0.0f;    // range: [0, 35]
         float keytrackAmount = 1.0f;
 
-        // Track last block's values to avoid redundant matrix rebuilds
-        float lastCutoff = -9999.0f;
-        float lastResonance = -9999.0f;
-        float lastKeytrack = -9999.0f;
-
         float sampleRate = 44100.0f;
 
+        // Smoothing objects for per-sample smoothing
+       SmoothedValue<float> cutoffSmooth;
+        SmoothedValue<float> resonanceSmooth;
+        SmoothedValue<float> keytrackSmooth;
+
         //-------------------------------------------------------------------------
-        // Prepare and reset
+        // prepare() sets up the voices and initializes the smoothers
         //-------------------------------------------------------------------------
         void prepare(PrepareSpecs specs)
         {
@@ -82,7 +71,7 @@ namespace project
             for (auto& v : filtersRight)
                 v.prepare(sampleRate);
 
-            // Set smoothing time to 10 ms
+            // Set smoothing time to 10ms (these affect only parameter changes)
             cutoffSmooth.reset(sampleRate, 0.01);
             resonanceSmooth.reset(sampleRate, 0.01);
             keytrackSmooth.reset(sampleRate, 0.01);
@@ -101,7 +90,7 @@ namespace project
         }
 
         //-------------------------------------------------------------------------
-        // Process audio (block-based smoothing)
+        // Process audio: update parameters every sample using smoothed values
         //-------------------------------------------------------------------------
         template <typename ProcessDataType>
         void process(ProcessDataType& data)
@@ -113,52 +102,39 @@ namespace project
             float* rightCh = audioBlock.getChannelPointer(1);
             int numSamples = (int)data.getNumSamples();
 
-            // Advance the smoothed values by the block length.
-            if (numSamples > 0)
-            {
-                cutoffSmooth.skip(numSamples);
-                resonanceSmooth.skip(numSamples);
-                keytrackSmooth.skip(numSamples);
-            }
-            float cVal = cutoffSmooth.getCurrentValue();
-            float rVal = resonanceSmooth.getCurrentValue();
-            float kVal = keytrackSmooth.getCurrentValue();
-
-            // Update voices if parameters changed since last block.
-            if ((cVal != lastCutoff) || (rVal != lastResonance) || (kVal != lastKeytrack))
-            {
-                for (auto& v : filtersLeft)
-                {
-                    v.setCutoff(cVal);
-                    v.setResonance(rVal);
-                    v.setKeytrack(kVal);
-                    v.applyChangesIfNeeded();
-                }
-                for (auto& v : filtersRight)
-                {
-                    v.setCutoff(cVal);
-                    v.setResonance(rVal);
-                    v.setKeytrack(kVal);
-                    v.applyChangesIfNeeded();
-                }
-                lastCutoff = cVal;
-                lastResonance = rVal;
-                lastKeytrack = kVal;
-            }
-
-            // Process audio sample-by-sample (matrix already rebuilt once per block)
             for (int i = 0; i < numSamples; ++i)
             {
-                float inL = leftCh[i];
-                float inR = rightCh[i];
+                // Get per-sample smoothed parameter values
+                float cVal = cutoffSmooth.getNextValue();
+                float rVal = resonanceSmooth.getNextValue();
+                float kVal = keytrackSmooth.getNextValue();
 
+                // Update every voice (modulation/keytracking must update every sample)
                 for (auto& v : filtersLeft)
-                    inL = v.processSample(inL);
+                {
+                    v.setCutoff(cVal);
+                    v.setResonance(rVal);
+                    v.setKeytrack(kVal);
+                    v.applyChangesIfNeeded(); // This now uses the optimized inversion
+                }
                 for (auto& v : filtersRight)
-                    inR = v.processSample(inR);
+                {
+                    v.setCutoff(cVal);
+                    v.setResonance(rVal);
+                    v.setKeytrack(kVal);
+                    v.applyChangesIfNeeded();
+                }
 
-                leftCh[i] = inL;
-                rightCh[i] = inR;
+                // Process the sample for each voice in series (or sum as needed)
+                float outL = leftCh[i];
+                float outR = rightCh[i];
+                for (auto& v : filtersLeft)
+                    outL = v.processSample(outL);
+                for (auto& v : filtersRight)
+                    outR = v.processSample(outR);
+
+                leftCh[i] = outL;
+                rightCh[i] = outR;
             }
         }
 
@@ -166,7 +142,7 @@ namespace project
         void processFrame(FrameDataType& data) {}
 
         //-------------------------------------------------------------------------
-        // Voice-level filter (OB8 tuning)
+        // OB8-Style Voice-Level Filter
         //-------------------------------------------------------------------------
         class AudioEffect
         {
@@ -177,13 +153,13 @@ namespace project
             {
                 sampleRate = fs;
                 baseCutoff = 1000.0f;
-                resonance = 0.0f;    // User resonance: range 0..35
-                rDamping = 3.4f;    // Fixed damping for OB8
+                resonance = 0.0f;    // User resonance range [0, 35]
+                rDamping = 3.4f;    // Fixed for OB8 tuning
                 keytrackAmount = 1.0f;
                 storedNote = 60;
                 reset();
                 dirtyFlags = 0;
-                updateAll();
+                updateAll(); // Initialize state-space matrices
             }
 
             void reset()
@@ -196,9 +172,8 @@ namespace project
             {
                 changedCutoff = 1 << 0,
                 changedResonance = 1 << 1,
-                changedDamping = 1 << 2,
-                changedKeytrack = 1 << 3,
-                changedNote = 1 << 4
+                changedKeytrack = 1 << 2,
+                changedNote = 1 << 3
             };
 
             inline void setCutoff(float c)
@@ -211,8 +186,6 @@ namespace project
                 resonance = r;
                 dirtyFlags |= changedResonance;
             }
-            // Damping is fixed; any call to setDamping is ignored.
-            inline void setDamping(float /*d*/) { rDamping = 3.4f; dirtyFlags |= changedDamping; }
             inline void setKeytrack(float kt)
             {
                 keytrackAmount = kt;
@@ -223,32 +196,35 @@ namespace project
                 storedNote = n;
                 dirtyFlags |= changedNote;
             }
-
             inline void applyChangesIfNeeded()
             {
-                if (dirtyFlags != 0)
-                    updateAll();
+                // For per-sample updates, this is called every sample.
+                updateAll();
             }
 
-            inline float processSample(float input)
+            inline float processSample(float in)
             {
-                // Optionally add a tiny noise floor to break symmetry:
+                // Optionally add a tiny noise floor to break symmetry
                 constexpr float noiseFloor = 0.0001f;
-                input += noiseFloor * (noiseGen.nextFloat() - 0.5f);
+                in += noiseFloor * (noiseGen.nextFloat() - 0.5f);
+
+                // Update state-space every sample using the optimized closed-form inversion
+                // (Parameters are assumed already updated via setCutoff, etc.)
+                // We assume updateAll() was already called in applyChangesIfNeeded().
 
                 float temp[4];
                 mulMatVec4(N, x, temp);
-                temp[0] += gB[0] * input;
-                temp[1] += gB[1] * input;
-                temp[2] += gB[2] * input;
-                temp[3] += gB[3] * input;
+                temp[0] += gB[0] * in;
+                temp[1] += gB[1] * in;
+                temp[2] += gB[2] * in;
+                temp[3] += gB[3] * in;
 
                 float newX[4];
+                // Use our optimized MInv (computed in updateAll)
                 mulMatVec4(MInv, temp, newX);
 
-                float out = 0.0f;
-                for (int i = 0; i < 4; ++i)
-                    out += C[i] * newX[i];
+                float out = C[0] * newX[0] + C[1] * newX[1] +
+                    C[2] * newX[2] + C[3] * newX[3];
 
                 for (int i = 0; i < 4; ++i)
                     x[i] = newX[i];
@@ -257,9 +233,10 @@ namespace project
             }
 
         private:
+            // Optimized updateAll() computes MInv using closed-form formulas
             void updateAll()
             {
-                // Compute cutoff frequency with keytracking
+                // Compute effective cutoff with keytracking
                 float semitones = ((float)storedNote - 60.0f) * keytrackAmount;
                 float noteFactor = std::exp2f(0.0833333f * semitones);
                 float fc = baseCutoff * noteFactor;
@@ -267,29 +244,81 @@ namespace project
                 float limit = 0.49f * sampleRate;
                 if (fc > limit) fc = limit;
 
-                // TPT warp factor
+                // Compute TPT warp factor
                 float norm = fc / sampleRate;
                 float warped = std::tan(MathConstants<float>::pi * norm);
                 g = 2.0f * warped;
 
-                // Build continuous-time state-space with OB8 tuning:
-                buildContinuousTimeSystem(); // Uses rDamping = 3.4 and OB8 resonance tuning.
-                buildDiscreteTimeMatrices();
-                invert4x4(M, MInv);
+                // Build continuous-time state-space (OB8 tuning)
+                // For OB8:
+                //   rDamping is fixed at 3.4f
+                //   Acont[0] = [ -2*r, -1, 0, -kf ]
+                //   where kf = resonance.
+                buildContinuousTimeSystem();
 
+                // Build discrete-time matrices using TPT: M = I - gA, N = I + gA, and compute gB = g*B.
+                buildDiscreteTimeMatrices();
+
+                // Instead of a generic inversion, use our optimized closed-form inversion:
+                computeOptimizedMInv();
+
+                // Copy Ccont to C (for output)
                 for (int i = 0; i < 4; ++i)
                     C[i] = Ccont[i];
 
                 dirtyFlags = 0;
             }
 
-            // Build continuous-time system (OB8 tuning)
+            // Optimized inversion for M = I - gA given its structure:
+            // M = [ [a, b, 0, c],
+            //       [-b, 1, 0, 0],
+            //       [0, -b, a, b],
+            //       [0,  0, -b, 1] ]
+            // where:
+            //   a = 1 + 2*g*rDamping,
+            //   b = g,
+            //   c = g * resonance.
+            inline void computeOptimizedMInv()
+            {
+                const float a = 1.0f + 2.0f * g * rDamping;
+                const float b = g;
+                const float c = g * resonance;
+                const float D = a + b * b;  // determinant factor for the 2x2 block
+
+                // Inverse of A11 = [ [a, b], [-b, 1] ]
+                const float inv00 = 1.0f / D;
+                const float inv01 = -b / D;
+                const float inv10 = b / D;
+                const float inv11 = a / D;
+
+                // Upper-right block: -A11_inv * A12 * A11_inv,
+                // where A12 = [ [0, c], [0, 0] ]
+                const float ur00 = -(c * inv00 * inv10); // = -c*(inv00*inv10)
+                const float ur01 = -(c * inv00 * inv11); // = -c*(inv00*inv11)
+                const float ur10 = -(c * inv10 * inv10); // = -c*(inv10*inv10)
+                const float ur11 = -(c * inv10 * inv11); // = -c*(inv10*inv11)
+
+                // Construct MInv in block form:
+                // Upper-left 2x2 block = A11_inv:
+                MInv[0][0] = inv00; MInv[0][1] = inv01;
+                MInv[1][0] = inv10; MInv[1][1] = inv11;
+                // Upper-right 2x2 block = computed above:
+                MInv[0][2] = ur00; MInv[0][3] = ur01;
+                MInv[1][2] = ur10; MInv[1][3] = ur11;
+                // Lower-left block is zero:
+                MInv[2][0] = 0.0f; MInv[2][1] = 0.0f;
+                MInv[3][0] = 0.0f; MInv[3][1] = 0.0f;
+                // Lower-right 2x2 block = A11_inv (same as upper-left):
+                MInv[2][2] = inv00; MInv[2][3] = inv01;
+                MInv[3][2] = inv10; MInv[3][3] = inv11;
+            }
+
             void buildContinuousTimeSystem()
             {
-                // For OB8, rDamping is fixed at 3.4 and the design has:
-                // x1'(t) = -2*r*x1 - x2 - kf*x4 + input
+                // For OB8 tuning:
+                // rDamping is fixed at 3.4; resonance is as set by the user.
                 const float r = rDamping;
-                const float kf = resonance; // range typically [0, 35] for OB8
+                const float kf = resonance;
                 for (int rr = 0; rr < 4; ++rr)
                     for (int cc = 0; cc < 4; ++cc)
                         Acont[rr][cc] = 0.0f;
@@ -307,7 +336,7 @@ namespace project
                 Acont[2][3] = -1.0f;
                 Acont[3][2] = 1.0f;
 
-                Bcont[0] = 1.0f;  // input directly into x1'
+                Bcont[0] = 1.0f;  // input goes to x1'
                 Ccont[3] = 1.0f;  // output from x4
             }
 
@@ -315,9 +344,10 @@ namespace project
             {
                 float gA[4][4];
                 for (int rr = 0; rr < 4; ++rr)
+                {
                     for (int cc = 0; cc < 4; ++cc)
                         gA[rr][cc] = g * Acont[rr][cc];
-
+                }
                 for (int rr = 0; rr < 4; ++rr)
                 {
                     for (int cc = 0; cc < 4; ++cc)
@@ -328,13 +358,13 @@ namespace project
                         N[rr][cc] = valPlus;
                     }
                 }
-
                 for (int i = 0; i < 4; ++i)
                     gB[i] = g * Bcont[i];
             }
 
             static void invert4x4(const float src[4][4], float dst[4][4])
             {
+                // Fallback generic inversion (should not be used with our optimized MInv)
                 float tmp[4][8];
                 for (int r = 0; r < 4; ++r)
                 {
@@ -397,28 +427,27 @@ namespace project
             juce::Random noiseGen;
         };
 
-        //==============================================================================
-        // External parameter setting (with block-based smoothing)
-        //==============================================================================
+        //-------------------------------------------------------------------------
+        // Parameter setting (per sample update)
+        //-------------------------------------------------------------------------
         template <int P>
         void setParameter(double val)
         {
-            if (P == 0) // Cutoff
+            if (P == 0)
             {
                 cutoffFrequency = (float)val;
                 cutoffSmooth.setTargetValue(cutoffFrequency);
             }
-            else if (P == 1) // Resonance
+            else if (P == 1)
             {
                 resonance = (float)val;
-                // Clamp to [0, 35]
                 if (resonance < 0.0f)
                     resonance = 0.0f;
                 if (resonance > 35.0f)
                     resonance = 35.0f;
                 resonanceSmooth.setTargetValue(resonance);
             }
-            else if (P == 2) // Keytrack
+            else if (P == 2)
             {
                 keytrackAmount = (float)val;
                 keytrackSmooth.setTargetValue(keytrackAmount);
@@ -434,7 +463,6 @@ namespace project
                 data.add(std::move(p));
             }
             {
-                // Range tuned for OB8: 0 to 35.0
                 parameter::data p("Resonance", { 0.0, 35.0, 0.01 });
                 registerCallback<1>(p);
                 p.setDefaultValue(0.0f);
@@ -446,12 +474,13 @@ namespace project
                 p.setDefaultValue(1.0f);
                 data.add(std::move(p));
             }
-            // The SVF Damping parameter is removed (fixed at 3.4)
         }
 
         void setExternalData(const ExternalData& data, int index) {}
 
-        // On note-on, update note number for all voices.
+        //-------------------------------------------------------------------------
+        // Note handling
+        //-------------------------------------------------------------------------
         void handleHiseEvent(HiseEvent& e)
         {
             if (e.isNoteOn())
@@ -467,7 +496,5 @@ namespace project
     private:
         PolyData<AudioEffect, NV> filtersLeft;
         PolyData<AudioEffect, NV> filtersRight;
-
-      
     };
 }
