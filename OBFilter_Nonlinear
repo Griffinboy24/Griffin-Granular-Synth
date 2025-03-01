@@ -336,7 +336,7 @@ namespace project
                 data.add(std::move(p));
             }
             {
-                parameter::data p("Resonance", { 0.0, 10.0, 0.01 });
+                parameter::data p("Resonance", { 0.0, 3.0, 0.01 });
                 registerCallback<1>(p);
                 p.setDefaultValue(0.0f);
                 data.add(std::move(p));
@@ -348,9 +348,9 @@ namespace project
                 data.add(std::move(p));
             }
             {
-                parameter::data p("SVF Damping (r)", { 0.6, 2.0, 0.01 });
+                parameter::data p("SVF Damping (r)", { 0.2, 4.0, 0.01 });
                 registerCallback<3>(p);
-                p.setDefaultValue(1.06f);
+                p.setDefaultValue(4.0f);
                 data.add(std::move(p));
             }
         }
