@@ -1,0 +1,354 @@
+#pragma once
+#include <JuceHeader.h>
+
+// To use poly effects in hise, you must use the create c++ node template feature in hise.
+// It won't work properly if you simply drag the header file in.
+
+namespace project
+{
+    using namespace juce;
+    using namespace hise;
+    using namespace scriptnode;
+
+    
+	// RAII utility
+
+    template <int NV> // NV: Number of Voices
+    struct Griffin_OBFilter : public data::base
+    {
+        SNEX_NODE(Griffin_OBFilter);
+
+        struct MetadataClass
+        {
+            SN_NODE_ID("Griffin_OBFilter");
+        };
+
+        static constexpr bool isModNode() { return false; }
+        static constexpr bool isPolyphonic() { return NV > 1; }
+        static constexpr bool hasTail() { return false; }
+        static constexpr bool isSuspendedOnSilence() { return false; }
+        static constexpr int  getFixChannelAmount() { return 2; }
+
+        static constexpr int  NumTables = 0;
+        static constexpr int  NumSliderPacks = 0;
+        static constexpr int  NumAudioFiles = 0;
+        static constexpr int  NumFilters = 0;
+        static constexpr int  NumDisplayBuffers = 0;
+
+        void prepare(PrepareSpecs specs)
+        {
+            sampleRate = specs.sampleRate;
+            piOverFs = MathConstants<float>::pi / sampleRate;
+            maxCutoff = std::min(0.49f * sampleRate, 20000.0f);
+
+            filtersLeft.prepare(specs);
+            filtersRight.prepare(specs);
+
+            for (auto& filter : filtersLeft)
+                filter.prepare(sampleRate, piOverFs, maxCutoff);
+
+            for (auto& filter : filtersRight)
+                filter.prepare(sampleRate, piOverFs, maxCutoff);
+        }
+
+        void reset()
+        {
+            for (auto& filter : filtersLeft)
+                filter.reset();
+
+            for (auto& filter : filtersRight)
+                filter.reset();
+        }
+
+        //=================================================
+        // Audio processing
+        //=================================================
+        template <typename ProcessDataType>
+        void process(ProcessDataType& data)
+        {
+            auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
+            auto audioBlock = fixData.toAudioBlock();
+
+            float* leftChannelData = audioBlock.getChannelPointer(0);
+            float* rightChannelData = audioBlock.getChannelPointer(1);
+            int numSamples = (int)data.getNumSamples();
+
+            // In polyphonic usage, loops over all voices
+            for (auto& leftFilter : filtersLeft)
+                leftFilter.process(leftChannelData, numSamples);
+
+            for (auto& rightFilter : filtersRight)
+                rightFilter.process(rightChannelData, numSamples);
+        }
+
+        template <typename FrameDataType>
+        void processFrame(FrameDataType& data) {}
+
+        //=================================================
+        // Voice-level Ladder filter (2-stage version)
+        //=================================================
+        class AudioEffect
+        {
+        public:
+            AudioEffect() = default;
+
+            void prepare(float fs, float piOverFsIn, float maxCutoffIn)
+            {
+                sampleRate = fs;
+                piOverFs = piOverFsIn;
+                maxCutoff = maxCutoffIn;
+                reset();
+                storedNote = 60;
+                baseCutoff = 1000.0f;
+                resonance = 0.0f;
+                keytrackAmount = 1.0f;
+                changedFlags = 0;
+            }
+
+            void reset()
+            {
+                s1 = s2 = 0.0f;
+            }
+
+            //=================================================
+            // Partial updates
+            //=================================================
+            enum ChangeMask
+            {
+                changedCutoff = 1 << 0,
+                changedResonance = 1 << 1,
+                changedKeytrack = 1 << 2,
+                changedNote = 1 << 3
+            };
+
+            inline void setCutoff(float c)
+            {
+                baseCutoff = c;
+                changedFlags |= changedCutoff;
+            }
+
+            inline void setResonance(float r)
+            {
+                resonance = r;
+                changedFlags |= changedResonance;
+            }
+
+            inline void setKeytrack(float k)
+            {
+                keytrackAmount = k;
+                changedFlags |= changedKeytrack;
+            }
+
+            inline void setNoteNumber(int n)
+            {
+                storedNote = n;
+                changedFlags |= changedNote;
+            }
+
+            inline void applyChangesIfNeeded()
+            {
+                if (changedFlags != 0)
+                {
+                    // If the cutoff or keytrack or note changed, recalc freq
+                    const uint32_t freqMask = changedCutoff | changedKeytrack | changedNote;
+                    if ((changedFlags & freqMask) != 0)
+                        recalcCutoffDependent();
+
+                    // If resonance changed, recalc k and gain compensation
+                    if ((changedFlags & changedResonance) != 0)
+                        recalcResonanceDependent();
+
+                    changedFlags = 0;
+                }
+            }
+
+            //=================================================
+            // Process audio
+            //=================================================
+            inline void process(float* samples, int numSamples)
+            {
+                applyChangesIfNeeded();
+
+                for (int i = 0; i < numSamples; ++i)
+                    samples[i] = processSample(samples[i]);
+            }
+
+        private:
+            //=================================================
+            // Recalculation chunks
+            //=================================================
+            inline void recalcCutoffDependent()
+            {
+                const float semitones = (static_cast<float>(storedNote) - 60.0f) * keytrackAmount;
+                const float noteFactor = std::exp2f(0.0833333f * semitones); // 2^(x/12)
+
+                float fc = baseCutoff * noteFactor;
+                if (fc < 20.0f)
+                    fc = 20.0f;
+                else if (fc > maxCutoff)
+                    fc = maxCutoff;
+
+                const float wc = piOverFs * fc;
+                gVal = std::tan(wc);
+                G = gVal / (1.0f + gVal);
+            }
+
+            inline void recalcResonanceDependent()
+            {
+                // Same formula; this is just carried over
+                k = 8.0f * resonance;
+
+                const float dbGain = (a * resonance * resonance) + (b * resonance) + c;
+                gainCompensation = std::pow(10.0f, dbGain * 0.05f);
+            }
+
+            //=================================================
+            // 2-stage Ladder
+            //=================================================
+            inline float processSample(float input)
+            {
+                float u = input - (k * s2);
+
+                s1 = G * (u - s1) + s1;
+                s2 = G * (s1 - s2) + s2;
+
+                return s2 * gainCompensation;
+            }
+
+            //=================================================
+            // Internal state
+            //=================================================
+            float sampleRate = 44100.0f;
+            float piOverFs = 0.0f;
+            float maxCutoff = 20000.0f;
+
+            // Filter states (now only two)
+            float s1 = 0.0f;
+            float s2 = 0.0f;
+
+            // Internal parameters
+            float baseCutoff = 1000.0f;
+            float resonance = 0.0f;
+            float keytrackAmount = 1.0f;
+            int   storedNote = 60;
+
+            // Precomputed partials
+            float k = 0.0f;
+            float G = 0.0f;
+            float gVal = 0.0f;
+            float gainCompensation = 1.0f;
+
+            // Dirty-flags
+            uint32_t changedFlags = 0;
+
+            // Quadratic constants for gain compensation
+            static constexpr float a = -8.0f;
+            static constexpr float b = 18.2f;
+            static constexpr float c = 1.5f;
+        };
+
+        //=================================================
+        // setParameter from the outside
+        //=================================================
+        template <int P>
+        void setParameter(double value)
+        {
+            if (P == 0) // Base Cutoff
+            {
+                cutoffFrequency = (float)value;
+                for (auto& filter : filtersLeft)
+                {
+                    filter.setCutoff(cutoffFrequency);
+                    filter.applyChangesIfNeeded();
+                }
+                for (auto& filter : filtersRight)
+                {
+                    filter.setCutoff(cutoffFrequency);
+                    filter.applyChangesIfNeeded();
+                }
+            }
+            else if (P == 1) // Resonance
+            {
+                resonance = (float)value;
+                for (auto& filter : filtersLeft)
+                {
+                    filter.setResonance(resonance);
+                    filter.applyChangesIfNeeded();
+                }
+                for (auto& filter : filtersRight)
+                {
+                    filter.setResonance(resonance);
+                    filter.applyChangesIfNeeded();
+                }
+            }
+            else if (P == 2) // Keytrack
+            {
+                keytrackAmount = (float)value;
+                for (auto& filter : filtersLeft)
+                {
+                    filter.setKeytrack(keytrackAmount);
+                    filter.applyChangesIfNeeded();
+                }
+                for (auto& filter : filtersRight)
+                {
+                    filter.setKeytrack(keytrackAmount);
+                    filter.applyChangesIfNeeded();
+                }
+            }
+        }
+
+        //=================================================
+        // Parameter definitions
+        //=================================================
+        void createParameters(ParameterDataList& data)
+        {
+            {
+                parameter::data p("Cutoff Frequency", { 20.0, 20000.0, 1.0 });
+                registerCallback<0>(p);
+                p.setDefaultValue(1000.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Resonance", { 0.0, 1.0, 0.01 });
+                registerCallback<1>(p);
+                p.setDefaultValue(0.0);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Keytrack Amount", { -1.0, 1.0, 0.5 });
+                registerCallback<2>(p);
+                p.setDefaultValue(1.0);
+                data.add(std::move(p));
+            }
+        }
+
+        void setExternalData(const ExternalData& data, int index) {}
+
+        //=================================================
+        // handle note-on
+        //=================================================
+        void handleHiseEvent(HiseEvent& e)
+        {
+            if (e.isNoteOn())
+            {
+                filtersLeft.get().setNoteNumber(e.getNoteNumber());
+                filtersLeft.get().applyChangesIfNeeded();
+
+                filtersRight.get().setNoteNumber(e.getNoteNumber());
+                filtersRight.get().applyChangesIfNeeded();
+            }
+        }
+
+    private:
+        PolyData<AudioEffect, NV> filtersLeft;
+        PolyData<AudioEffect, NV> filtersRight;
+
+        float cutoffFrequency = 1000.0f;
+        float resonance = 0.0f;
+        float keytrackAmount = 1.0f;
+
+        float sampleRate = 44100.0f;
+        float piOverFs = 0.0f;
+        float maxCutoff = 20000.0f;
+    };
+}
