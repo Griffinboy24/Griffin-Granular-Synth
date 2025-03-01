@@ -259,8 +259,8 @@ namespace project
             void updateAll()
             {
                 // 1) enforce constraints
-                if (resonance < 0.0f) resonance = 0.0f;
-                if (resonance > 1.0f) resonance = 1.0f;
+               // if (resonance < 0.0f) resonance = 0.0f;
+               // if (resonance > 2.0f) resonance = 2.0f;
                 if (rDamping < 0.0f) rDamping = 0.0f;
 
                 // 2) compute effective cutoff freq with keytrack
@@ -557,7 +557,7 @@ namespace project
                 data.add(std::move(p));
             }
             {
-                parameter::data p("Resonance", { 0.0, 1.0, 0.01 });
+                parameter::data p("Resonance", { 0.0, 2.0, 0.01 });
                 registerCallback<1>(p);
                 p.setDefaultValue(0.0f);
                 data.add(std::move(p));
@@ -565,7 +565,7 @@ namespace project
             {
                 parameter::data p("Keytrack Amount", { -1.0, 1.0, 0.01 });
                 registerCallback<2>(p);
-                p.setDefaultValue(1.0f);
+                p.setDefaultValue(0.0f);
                 data.add(std::move(p));
             }
             {
