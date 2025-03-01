@@ -43,7 +43,7 @@ namespace project
 
         static constexpr bool isModNode() { return false; }
         static constexpr bool isPolyphonic() { return NV > 1; }
-        static constexpr bool hasTail() { return false; }
+        static constexpr bool hasTail() { return true; }
         static constexpr bool isSuspendedOnSilence() { return false; }
         static constexpr int  getFixChannelAmount() { return 2; }
 
