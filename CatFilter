@@ -1,0 +1,494 @@
+#pragma once
+#include <JuceHeader.h>
+
+/*
+  ==================================================================================================
+   2-SVF + Global Feedback filter (Werner & McClellan DAFx-2020), pinned to "CAT-like" style but
+   with bigger feedback range so that high resonance is clearly audible.
+
+   Key Points:
+    - local damping r ~ 1.06
+    - global feedback sign gamma0 ~ +0.2 (adjust to taste)
+    - "resonance" param can range up to 4.0 (instead of 1.0)
+    - block-based param smoothing (only re-inverts the matrix once per block)
+    - So CPU is much lower, and you can actually hear the resonance peak.
+
+  For a milder, more "true CAT" sound:
+    - lower gamma0 to around +0.1
+    - reduce the max resonance range to 1.0
+    - the peak will be subtle, never huge.
+
+   Reference:
+     "Moog Ladder Filter Generalizations Based on State Variable Filters"
+       by K. J. Werner & R. McClellan (DAFx-2020)
+  ==================================================================================================
+*/
+
+namespace project
+{
+    using namespace juce;
+    using namespace hise;
+    using namespace scriptnode;
+
+    //==============================================================================
+    template <int NV> // number of voices
+    struct Griffin_OBFilter : public data::base
+    {
+        SNEX_NODE(Griffin_OBFilter);
+
+        struct MetadataClass
+        {
+            SN_NODE_ID("Griffin_OBFilter");
+        };
+
+        static constexpr bool isModNode() { return false; }
+        static constexpr bool isPolyphonic() { return NV > 1; }
+        static constexpr bool hasTail() { return false; }
+        static constexpr bool isSuspendedOnSilence() { return false; }
+        static constexpr int  getFixChannelAmount() { return 2; }
+
+        // no tables / slider packs / etc.
+        static constexpr int  NumTables = 0;
+        static constexpr int  NumSliderPacks = 0;
+        static constexpr int  NumAudioFiles = 0;
+        static constexpr int  NumFilters = 0;
+        static constexpr int  NumDisplayBuffers = 0;
+
+        //==============================================================================
+        void prepare(PrepareSpecs specs)
+        {
+            sampleRate = specs.sampleRate;
+            filtersLeft.prepare(specs);
+            filtersRight.prepare(specs);
+
+            // Prepare each voice
+            for (auto& v : filtersLeft)
+                v.prepare(sampleRate);
+            for (auto& v : filtersRight)
+                v.prepare(sampleRate);
+
+            // Initialize smoothed param objects:
+            cutoffSmooth.reset(sampleRate, 0.01);     // 10ms smoothing
+            resonanceSmooth.reset(sampleRate, 0.01);
+            keytrackSmooth.reset(sampleRate, 0.01);
+
+            cutoffSmooth.setCurrentAndTargetValue(cutoffFrequency);
+            resonanceSmooth.setCurrentAndTargetValue(resonance);
+            keytrackSmooth.setCurrentAndTargetValue(keytrackAmount);
+        }
+
+        void reset()
+        {
+            for (auto& v : filtersLeft)
+                v.reset();
+            for (auto& v : filtersRight)
+                v.reset();
+        }
+
+        //==============================================================================
+        // Processing with block-based param smoothing
+        //==============================================================================
+        template <typename ProcessDataType>
+        void process(ProcessDataType& data)
+        {
+            auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
+            auto audioBlock = fixData.toAudioBlock();
+
+            float* leftCh = audioBlock.getChannelPointer(0);
+            float* rightCh = audioBlock.getChannelPointer(1);
+            int numSamples = (int)data.getNumSamples();
+
+            // 1) Skip the smoothed objects to the *end* of this block
+            //    so we get final param values for this block. 
+            //    We only do a single matrix rebuild with those final values.
+            if (numSamples > 0)
+            {
+                cutoffSmooth.skip(numSamples);
+                resonanceSmooth.skip(numSamples);
+                keytrackSmooth.skip(numSamples);
+            }
+
+            float cVal = cutoffSmooth.getCurrentValue();
+            float rVal = resonanceSmooth.getCurrentValue();
+            float kVal = keytrackSmooth.getCurrentValue();
+
+            // 2) If these differ from last block's params, apply them to each voice once
+            if ((cVal != lastCutoff) || (rVal != lastResonance) || (kVal != lastKeytrack))
+            {
+                for (auto& v : filtersLeft)
+                {
+                    v.setCutoff(cVal);
+                    v.setResonance(rVal);
+                    v.setKeytrack(kVal);
+                    v.applyChangesIfNeeded();
+                }
+                for (auto& v : filtersRight)
+                {
+                    v.setCutoff(cVal);
+                    v.setResonance(rVal);
+                    v.setKeytrack(kVal);
+                    v.applyChangesIfNeeded();
+                }
+
+                lastCutoff = cVal;
+                lastResonance = rVal;
+                lastKeytrack = kVal;
+            }
+
+            // 3) Now do the filter process for the entire block, 
+            //    with the final updated parameters
+            for (int i = 0; i < numSamples; ++i)
+            {
+                float inL = leftCh[i];
+                float inR = rightCh[i];
+
+                for (auto& v : filtersLeft)
+                    inL = v.processSample(inL);
+                for (auto& v : filtersRight)
+                    inR = v.processSample(inR);
+
+                leftCh[i] = inL;
+                rightCh[i] = inR;
+            }
+        }
+
+        template <typename FrameDataType>
+        void processFrame(FrameDataType& data) {}
+
+        //==============================================================================
+        // The voice-level filter: 2-SVF with local damping r=~1.06, 
+        // plus global feedback gamma0*(resonance). 
+        // gamma0=+0.2 => more noticeable resonance
+        //==============================================================================
+        class AudioEffect
+        {
+        public:
+            void prepare(float fs)
+            {
+                sampleRate = fs;
+                baseCutoff = 1000.0f;
+                resonance = 0.0f;
+                keytrackAmount = 1.0f;
+                storedNote = 60;
+                reset();
+                dirtyFlags = 0;
+                updateAll();
+            }
+
+            void reset()
+            {
+                for (int i = 0; i < 4; ++i)
+                    x[i] = 0.0f;
+            }
+
+            enum Dirty : uint32_t
+            {
+                changedCutoff = 1 << 0,
+                changedResonance = 1 << 1,
+                changedKeytrack = 1 << 2,
+                changedNote = 1 << 3
+            };
+
+            inline void setCutoff(float c)
+            {
+                baseCutoff = c;
+                dirtyFlags |= changedCutoff;
+            }
+            inline void setResonance(float r)
+            {
+                resonance = r; // can be up to e.g. 4
+                dirtyFlags |= changedResonance;
+            }
+            inline void setKeytrack(float kt)
+            {
+                keytrackAmount = kt;
+                dirtyFlags |= changedKeytrack;
+            }
+            inline void setNoteNumber(int n)
+            {
+                storedNote = n;
+                dirtyFlags |= changedNote;
+            }
+
+            inline void applyChangesIfNeeded()
+            {
+                if (dirtyFlags != 0)
+                    updateAll();
+            }
+
+            inline float processSample(float inputSample)
+            {
+                float temp[4];
+                mulMatVec4(N, x, temp);
+
+                temp[0] += gB[0] * inputSample;
+                temp[1] += gB[1] * inputSample;
+                temp[2] += gB[2] * inputSample;
+                temp[3] += gB[3] * inputSample;
+
+                float newX[4];
+                mulMatVec4(MInv, temp, newX);
+
+                float out = (C[0] * newX[0] + C[1] * newX[1] + C[2] * newX[2] + C[3] * newX[3]);
+
+                for (int i = 0; i < 4; ++i)
+                    x[i] = newX[i];
+
+                return out;
+            }
+
+        private:
+            void updateAll()
+            {
+                float fc = baseCutoff;
+                if (fc < 20.0f) fc = 20.0f;
+                float limit = 0.49f * sampleRate;
+                if (fc > limit) fc = limit;
+
+                float semitones = (float)storedNote - 60.0f;
+                semitones *= keytrackAmount;
+                float noteFactor = std::exp2f(0.0833333f * semitones);
+                fc *= noteFactor;
+
+                // warp for TPT
+                float norm = fc / sampleRate;
+                float warped = std::tan(MathConstants<float>::pi * norm);
+                g = 2.0f * warped;
+
+                buildContinuousTimeSystem();
+                buildDiscreteTimeMatrices();
+                invert4x4(M, MInv);
+
+                // copy cCont => C
+                for (int i = 0; i < 4; ++i)
+                    C[i] = Ccont[i];
+
+                dirtyFlags = 0;
+            }
+
+            void buildContinuousTimeSystem()
+            {
+                // We'll pick r ~1.06 and gamma0=+0.2 => bigger peak
+                const float r = 1.06f;
+                const float gamma0 = 0.2f;  // can be changed to +0.1 for milder or bigger for more resonance
+                // user resonance can exceed 1 for bigger feedback
+                const float kVal = resonance;
+
+                // zero out
+                for (int rr = 0; rr < 4; ++rr)
+                    for (int cc = 0; cc < 4; ++cc)
+                        Acont[rr][cc] = 0.0f;
+                for (int i = 0; i < 4; ++i)
+                {
+                    Bcont[i] = 0.0f;
+                    Ccont[i] = 0.0f;
+                }
+
+                // Our design: x1'(t) = -2*r*x1 - x2 + gamma0*kVal*x4 + in
+                Acont[0][0] = -2.0f * r;
+                Acont[0][1] = -1.0f;
+                Acont[0][3] = - gamma0 * resonance;
+
+                // x2'(t) = x1
+                Acont[1][0] = 1.0f;
+
+                // x3'(t) = -2*r*x3 - x4 + x2
+                Acont[2][1] = 1.0f;
+                Acont[2][2] = -2.0f * r;
+                Acont[2][3] = -1.0f;
+
+                // x4'(t) = x3
+                Acont[3][2] = 1.0f;
+
+                // B => x1'(t) gets +1 * input
+                Bcont[0] = 1.0f;
+
+                // C => output is x4
+                Ccont[3] = 1.0f;
+            }
+
+            void buildDiscreteTimeMatrices()
+            {
+                float gA[4][4];
+                for (int rr = 0; rr < 4; ++rr)
+                {
+                    for (int cc = 0; cc < 4; ++cc)
+                        gA[rr][cc] = g * Acont[rr][cc];
+                }
+
+                for (int rr = 0; rr < 4; ++rr)
+                {
+                    for (int cc = 0; cc < 4; ++cc)
+                    {
+                        float valMinus = ((rr == cc) ? 1.0f : 0.0f) - gA[rr][cc];
+                        float valPlus = ((rr == cc) ? 1.0f : 0.0f) + gA[rr][cc];
+                        M[rr][cc] = valMinus;
+                        N[rr][cc] = valPlus;
+                    }
+                }
+
+                for (int i = 0; i < 4; ++i)
+                    gB[i] = g * Bcont[i];
+            }
+
+            static void invert4x4(const float src[4][4], float dst[4][4])
+            {
+                float tmp[4][8];
+                for (int r = 0; r < 4; ++r)
+                {
+                    for (int c = 0; c < 4; ++c)
+                        tmp[r][c] = src[r][c];
+                    for (int c = 4; c < 8; ++c)
+                        tmp[r][c] = (c - 4 == r) ? 1.0f : 0.0f;
+                }
+
+                for (int c = 0; c < 4; ++c)
+                {
+                    float pivot = tmp[c][c];
+                    if (std::fabs(pivot) < 1.0e-12f)
+                        pivot = 1.0e-12f;
+
+                    for (int cc = 0; cc < 8; ++cc)
+                        tmp[c][cc] /= pivot;
+
+                    for (int r = 0; r < 4; ++r)
+                    {
+                        if (r != c)
+                        {
+                            float factor = tmp[r][c];
+                            for (int cc = c; cc < 8; ++cc)
+                                tmp[r][cc] -= factor * tmp[c][cc];
+                        }
+                    }
+                }
+
+                for (int r = 0; r < 4; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        dst[r][c] = tmp[r][c + 4];
+            }
+
+            static void mulMatVec4(const float mat[4][4], const float vec[4], float out[4])
+            {
+                for (int rr = 0; rr < 4; ++rr)
+                {
+                    float sum = 0.0f;
+                    for (int cc = 0; cc < 4; ++cc)
+                        sum += mat[rr][cc] * vec[cc];
+                    out[rr] = sum;
+                }
+            }
+
+            float sampleRate = 44100.0f;
+            float baseCutoff = 1000.0f;
+            float resonance = 0.0f;
+            float keytrackAmount = 1.0f;
+            int   storedNote = 60;
+
+            float x[4] = { 0.f, 0.f, 0.f, 0.f };
+
+            // TPT warp
+            float g = 0.f;
+
+            // continuous-time
+            float Acont[4][4];
+            float Bcont[4];
+            float Ccont[4];
+
+            // discrete-time
+            float M[4][4], N[4][4], MInv[4][4];
+            float gB[4];
+            float C[4];
+
+            uint32_t dirtyFlags = 0;
+        };
+
+        //==============================================================================
+        // Parameter setting: set param, do a short ramp, block-based
+        //==============================================================================
+        template <int P>
+        void setParameter(double val)
+        {
+            if (P == 0) // Cutoff
+            {
+                cutoffFrequency = (float)val;
+                cutoffSmooth.setTargetValue(cutoffFrequency);
+            }
+            else if (P == 1) // Resonance
+            {
+                resonance = (float)val;
+                if (resonance < 0.0f)  resonance = 0.0f;
+                if (resonance > 4.0f)  resonance = 4.0f;  // up to 4 => bigger peak
+                resonanceSmooth.setTargetValue(resonance);
+            }
+            else if (P == 2) // Keytrack
+            {
+                keytrackAmount = (float)val;
+                keytrackSmooth.setTargetValue(keytrackAmount);
+            }
+        }
+
+        void createParameters(ParameterDataList& data)
+        {
+            {
+                parameter::data p("Cutoff Frequency", { 20.0, 20000.0, 1.0 });
+                registerCallback<0>(p);
+                p.setDefaultValue(1000.0f);
+                data.add(std::move(p));
+            }
+            {
+                // Let user go up to 4 => strong resonance
+                parameter::data p("Resonance", { 0.0, 4.0, 0.05 });
+                registerCallback<1>(p);
+                p.setDefaultValue(0.0f);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Keytrack Amount", { -1.0, 2.0, 0.01 });
+                registerCallback<2>(p);
+                p.setDefaultValue(1.0f);
+                data.add(std::move(p));
+            }
+        }
+
+        void setExternalData(const ExternalData& data, int index) {}
+
+        // On note-on, set note number for all voices
+        void handleHiseEvent(HiseEvent& e)
+        {
+            if (e.isNoteOn())
+            {
+                for (auto& v : filtersLeft)
+                {
+                    v.setNoteNumber(e.getNoteNumber());
+                    v.applyChangesIfNeeded();
+                }
+                for (auto& v : filtersRight)
+                {
+                    v.setNoteNumber(e.getNoteNumber());
+                    v.applyChangesIfNeeded();
+                }
+            }
+        }
+
+    private:
+        PolyData<AudioEffect, NV> filtersLeft;
+        PolyData<AudioEffect, NV> filtersRight;
+
+        float sampleRate = 44100.0f;
+
+        // "raw" parameter values
+        float cutoffFrequency = 1000.0f;
+        float resonance = 0.0f;
+        float keytrackAmount = 1.0f;
+
+        // smoothed param objects (block-based usage)
+      SmoothedValue<float> cutoffSmooth;
+        SmoothedValue<float> resonanceSmooth;
+       SmoothedValue<float> keytrackSmooth;
+
+        // track the last block's param for condition
+        float lastCutoff = -9999.0f;
+        float lastResonance = -9999.0f;
+        float lastKeytrack = -9999.0f;
+    };
+}
