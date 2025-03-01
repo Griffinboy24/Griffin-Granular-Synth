@@ -1,0 +1,380 @@
+#pragma once
+#include <JuceHeader.h>
+
+namespace project
+{
+    using namespace juce;
+    using namespace hise;
+    using namespace scriptnode;
+
+    template <int NV>
+    struct Griffin_OBFilter : public data::base
+    {
+        SNEX_NODE(Griffin_OBFilter);
+
+        struct MetadataClass { SN_NODE_ID("Griffin_OBFilter"); };
+
+        static constexpr bool isModNode() { return false; }
+        static constexpr bool isPolyphonic() { return NV > 1; }
+        static constexpr bool hasTail() { return false; }
+        static constexpr bool isSuspendedOnSilence() { return false; }
+        static constexpr int  getFixChannelAmount() { return 2; }
+
+        static constexpr int  NumTables = 0;
+        static constexpr int  NumSliderPacks = 0;
+        static constexpr int  NumAudioFiles = 0;
+        static constexpr int  NumFilters = 0;
+        static constexpr int  NumDisplayBuffers = 0;
+
+        void prepare(PrepareSpecs specs)
+        {
+            sampleRate = specs.sampleRate;
+            filtersLeft.prepare(specs);
+            filtersRight.prepare(specs);
+            for (auto& f : filtersLeft)  f.prepare(sampleRate);
+            for (auto& f : filtersRight) f.prepare(sampleRate);
+        }
+
+        void reset()
+        {
+            for (auto& f : filtersLeft)  f.reset();
+            for (auto& f : filtersRight) f.reset();
+        }
+
+        template <typename ProcessDataType>
+        void process(ProcessDataType& data)
+        {
+            auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
+            auto audioBlock = fixData.toAudioBlock();
+            float* leftChannelData = audioBlock.getChannelPointer(0);
+            float* rightChannelData = audioBlock.getChannelPointer(1);
+            int numSamples = (int)data.getNumSamples();
+            for (auto& f : filtersLeft)  f.processBlock(leftChannelData, numSamples);
+            for (auto& f : filtersRight) f.processBlock(rightChannelData, numSamples);
+        }
+
+        template <typename FrameDataType>
+        void processFrame(FrameDataType& data) {}
+
+        class AudioEffect
+        {
+        public:
+            void prepare(float fs)
+            {
+                sampleRate = fs;
+                baseCutoff = 1000.0f;
+                resonance = 0.0f;
+                rDamping = 1.06f;
+                keytrackAmount = 1.0f;
+                storedNote = 60;
+                reset();
+                dirtyFlags = 0;
+                updateAll();
+            }
+
+            void reset() { for (int i = 0; i < 4; ++i) x[i] = 0.0f; }
+
+            enum Dirty : uint32_t
+            {
+                changedCutoff = 1 << 0,
+                changedResonance = 1 << 1,
+                changedDamping = 1 << 2,
+                changedKeytrack = 1 << 3,
+                changedNote = 1 << 4
+            };
+
+            inline void setCutoff(float c) { baseCutoff = c; dirtyFlags |= changedCutoff; }
+            inline void setResonance(float r) { resonance = r; dirtyFlags |= changedResonance; }
+            inline void setDamping(float d) { rDamping = d; dirtyFlags |= changedDamping; }
+            inline void setKeytrack(float k) { keytrackAmount = k; dirtyFlags |= changedKeytrack; }
+            inline void setNoteNumber(int n) { storedNote = n; dirtyFlags |= changedNote; }
+
+            inline void applyChangesIfNeeded() { if (dirtyFlags != 0) updateAll(); }
+
+            void processBlock(float* buf, int numSamples)
+            {
+                applyChangesIfNeeded();
+                for (int i = 0; i < numSamples; ++i)
+                    buf[i] = processSampleNonlinear(buf[i]);
+            }
+
+        private:
+            //===========================================================================================
+            // Nonlinear 2-SVF (4th-order) with global feedback. Using a per-sample Newton iteration for
+            // zero-delay saturation. The continuous equations:
+            //   f1 = -2*r*x1 - x2 - k*satur(x4) + in
+            //   f2 = x1
+            //   f3 = -2*r*x3 - x4 + x2
+            //   f4 = x3
+            // Then integrated with trapezoidal rule => we solve 4 equations in x[n+1] each sample.
+            //===========================================================================================
+
+            inline float processSampleNonlinear(float input)
+            {
+                const float oldX1 = x[0], oldX2 = x[1], oldX3 = x[2], oldX4 = x[3];
+                float newX1 = oldX1, newX2 = oldX2, newX3 = oldX3, newX4 = oldX4;
+                float fOld[4]; computeF(oldX1, oldX2, oldX3, oldX4, input, fOld);
+                const float halfG = 0.5f * g;
+                const int maxIters = 5;
+                const float eps = 1.0e-7f;
+
+                for (int iter = 0; iter < maxIters; ++iter)
+                {
+                    float fNew[4]; computeF(newX1, newX2, newX3, newX4, input, fNew);
+                    float R[4];
+                    R[0] = newX1 - oldX1 - halfG * (fNew[0] + fOld[0]);
+                    R[1] = newX2 - oldX2 - halfG * (fNew[1] + fOld[1]);
+                    R[2] = newX3 - oldX3 - halfG * (fNew[2] + fOld[2]);
+                    R[3] = newX4 - oldX4 - halfG * (fNew[3] + fOld[3]);
+
+                    float J[16];
+                    computeJacobian(newX1, newX2, newX3, newX4, halfG, J);
+
+                    float delta[4];
+                    solve4x4(J, R, delta); // J * delta = R
+
+                    newX1 -= delta[0];
+                    newX2 -= delta[1];
+                    newX3 -= delta[2];
+                    newX4 -= delta[3];
+
+                    float mag = std::fabs(delta[0]) + std::fabs(delta[1]) + std::fabs(delta[2]) + std::fabs(delta[3]);
+                    if (mag < eps) break;
+                }
+
+                x[0] = newX1; x[1] = newX2; x[2] = newX3; x[3] = newX4;
+                return newX4; // output is x4
+            }
+
+            inline void computeF(float xx1, float xx2, float xx3, float xx4, float in, float* outF)
+            {
+                float sat4 = std::tanh(xx4);
+                outF[0] = -2.0f * rDamping * xx1 - xx2 - (resonance * sat4) + in;
+                outF[1] = xx1;
+                outF[2] = -2.0f * rDamping * xx3 - xx4 + xx2;
+                outF[3] = xx3;
+            }
+
+            inline void computeJacobian(float xx1, float xx2, float xx3, float xx4, float halfG, float* outJ)
+            {
+                // R[0] = x1_n+1 - x1_n - halfG*( f1_n+1 + f1_n )
+                // partial wrt x1_n+1 => d/dx1_n+1 of ( x1_n+1 ) => 1
+                // minus halfG * partial of f1(x1_n+1,...) wrt x1_n+1 => - halfG( -2*r )
+                // => 1 + halfG( 2*r )
+                float dSat4 = 1.0f - std::tanh(xx4) * std::tanh(xx4);
+
+                // f1 wrt x1 => -2*r
+                // f1 wrt x2 => -1
+                // f1 wrt x4 => -k * dSat( x4 )
+                // f1 wrt x3 => 0
+
+                // So we build 4x4 Jacobian of R wrt newX:
+                // dR1/dx1 = 1 - halfG( d f1/dx1 ), but note the minus sign => R1 = x1 - oldX1 - halfG(...).
+                // Carefully: R1 = x1 - oldX1 - halfG*( f1(new) + f1(old) ), partial wrt x1 => 1 - halfG( d f1/dx1 )
+                // We'll do it systematically:
+
+                // For clarity:
+                // J(r,c) = d(Rr)/d(Xc).
+
+                float df1_dx1 = -2.0f * rDamping;
+                float df1_dx2 = -1.0f;
+                float df1_dx3 = 0.0f;
+                float df1_dx4 = -resonance * dSat4;
+
+                float df2_dx1 = 1.0f;
+                float df2_dx2 = 0.0f;
+                float df2_dx3 = 0.0f;
+                float df2_dx4 = 0.0f;
+
+                float df3_dx1 = 0.0f;
+                float df3_dx2 = 1.0f;
+                float df3_dx3 = -2.0f * rDamping;
+                float df3_dx4 = -1.0f;
+
+                float df4_dx1 = 0.0f;
+                float df4_dx2 = 0.0f;
+                float df4_dx3 = 1.0f;
+                float df4_dx4 = 0.0f;
+
+                // R1 wrt x1
+                outJ[0] = 1.0f - halfG * df1_dx1;
+                // R1 wrt x2
+                outJ[1] = -halfG * df1_dx2;
+                // R1 wrt x3
+                outJ[2] = -halfG * df1_dx3;
+                // R1 wrt x4
+                outJ[3] = -halfG * df1_dx4;
+
+                // R2 wrt x1
+                outJ[4] = -halfG * df2_dx1;
+                // R2 wrt x2
+                outJ[5] = 1.0f - halfG * df2_dx2;
+                // R2 wrt x3
+                outJ[6] = -halfG * df2_dx3;
+                // R2 wrt x4
+                outJ[7] = -halfG * df2_dx4;
+
+                // R3 wrt x1
+                outJ[8] = -halfG * df3_dx1;
+                // R3 wrt x2
+                outJ[9] = -halfG * df3_dx2;
+                // R3 wrt x3
+                outJ[10] = 1.0f - halfG * df3_dx3;
+                // R3 wrt x4
+                outJ[11] = -halfG * df3_dx4;
+
+                // R4 wrt x1
+                outJ[12] = -halfG * df4_dx1;
+                // R4 wrt x2
+                outJ[13] = -halfG * df4_dx2;
+                // R4 wrt x3
+                outJ[14] = -halfG * df4_dx3;
+                // R4 wrt x4
+                outJ[15] = 1.0f - halfG * df4_dx4;
+            }
+
+            // solve J * delta = R (4x4)
+            inline void solve4x4(const float* j, const float* r, float* delta)
+            {
+                // We'll do a small Gauss elimination inline
+                float mat[4][8];
+                for (int i = 0; i < 4; ++i)
+                {
+                    for (int c = 0; c < 4; ++c)
+                        mat[i][c] = j[i * 4 + c];
+                    mat[i][4] = r[i];
+                    // fill the rest as 0 or we can do a 5-col approach
+                    // but we only need 5 columns actually. Let's just do 5:
+                    for (int c = 5; c < 8; ++c)
+                        mat[i][c] = 0.0f; // not used
+                }
+
+                for (int c = 0; c < 4; ++c)
+                {
+                    float pivot = mat[c][c];
+                    if (std::fabs(pivot) < 1.0e-12f) pivot = 1.0e-12f;
+                    for (int cc = c; cc < 5; ++cc) mat[c][cc] /= pivot;
+                    for (int r2 = 0; r2 < 4; ++r2)
+                    {
+                        if (r2 != c)
+                        {
+                            float f = mat[r2][c];
+                            for (int cc = c; cc < 5; ++cc)
+                                mat[r2][cc] -= f * mat[c][cc];
+                        }
+                    }
+                }
+
+                // read out solution
+                delta[0] = mat[0][4];
+                delta[1] = mat[1][4];
+                delta[2] = mat[2][4];
+                delta[3] = mat[3][4];
+            }
+
+            void updateAll()
+            {
+                float semitones = (float)storedNote - 60.0f;
+                semitones *= keytrackAmount;
+                float noteFactor = std::exp2f(0.0833333f * semitones);
+                float fc = baseCutoff * noteFactor;
+                if (fc < 20.0f) fc = 20.0f;
+                float limit = 0.49f * sampleRate;
+                if (fc > limit) fc = limit;
+                float norm = fc / sampleRate;
+                float warped = std::tan(MathConstants<float>::pi * norm);
+                g = 2.0f * warped;
+                dirtyFlags = 0;
+            }
+
+            float sampleRate = 44100.0f;
+            float baseCutoff = 1000.0f;
+            float resonance = 0.0f;
+            float rDamping = 1.06f;
+            float keytrackAmount = 1.0f;
+            int   storedNote = 60;
+            float x[4] = { 0,0,0,0 };
+            float g = 0.0f;
+            uint32_t dirtyFlags = 0;
+        };
+
+        template <int P>
+        void setParameter(double val)
+        {
+            if (P == 0)
+            {
+                cutoffFrequency = (float)val;
+                for (auto& f : filtersLeft) { f.setCutoff(cutoffFrequency);    f.applyChangesIfNeeded(); }
+                for (auto& f : filtersRight) { f.setCutoff(cutoffFrequency);    f.applyChangesIfNeeded(); }
+            }
+            else if (P == 1)
+            {
+                resonance = (float)val;
+                for (auto& f : filtersLeft) { f.setResonance(resonance);       f.applyChangesIfNeeded(); }
+                for (auto& f : filtersRight) { f.setResonance(resonance);       f.applyChangesIfNeeded(); }
+            }
+            else if (P == 2)
+            {
+                keytrackAmount = (float)val;
+                for (auto& f : filtersLeft) { f.setKeytrack(keytrackAmount);   f.applyChangesIfNeeded(); }
+                for (auto& f : filtersRight) { f.setKeytrack(keytrackAmount);   f.applyChangesIfNeeded(); }
+            }
+            else if (P == 3)
+            {
+                rDamp = (float)val;
+                for (auto& f : filtersLeft) { f.setDamping(rDamp);            f.applyChangesIfNeeded(); }
+                for (auto& f : filtersRight) { f.setDamping(rDamp);            f.applyChangesIfNeeded(); }
+            }
+        }
+
+        void createParameters(ParameterDataList& data)
+        {
+            {
+                parameter::data p("Cutoff Frequency", { 20.0, 20000.0, 1.0 });
+                registerCallback<0>(p);
+                p.setDefaultValue(1000.0f);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Resonance", { 0.0, 10.0, 0.01 });
+                registerCallback<1>(p);
+                p.setDefaultValue(0.0f);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("Keytrack Amount", { -1.0, 1.0, 0.01 });
+                registerCallback<2>(p);
+                p.setDefaultValue(1.0f);
+                data.add(std::move(p));
+            }
+            {
+                parameter::data p("SVF Damping (r)", { 0.6, 2.0, 0.01 });
+                registerCallback<3>(p);
+                p.setDefaultValue(1.06f);
+                data.add(std::move(p));
+            }
+        }
+
+        void setExternalData(const ExternalData& data, int index) {}
+
+        void handleHiseEvent(HiseEvent& e)
+        {
+            if (e.isNoteOn())
+            {
+                filtersLeft.get().setNoteNumber(e.getNoteNumber());
+                filtersLeft.get().applyChangesIfNeeded();
+                filtersRight.get().setNoteNumber(e.getNoteNumber());
+                filtersRight.get().applyChangesIfNeeded();
+            }
+        }
+
+    private:
+        PolyData<AudioEffect, NV> filtersLeft;
+        PolyData<AudioEffect, NV> filtersRight;
+        float cutoffFrequency = 1000.0f;
+        float resonance = 0.0f;
+        float keytrackAmount = 1.0f;
+        float rDamp = 1.06f;
+        float sampleRate = 44100.0f;
+    };
+}
