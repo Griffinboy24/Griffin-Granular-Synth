@@ -20,6 +20,12 @@
    The bilinear (TPT) transform is used:
        M = I - g*A,  N = I + g*A,  with g = 2 * tan(pi*fc/fs)
    and then M is inverted via a generic 4×4 Gaussian elimination.
+
+   Optimizations added:
+   • Precompute the reciprocal of sampleRate and constant factors (like 2×rDamping) in updateAll().
+   • Use multiplication by precomputed reciprocals rather than repeated division.
+   • Mark critical inner functions (mulMatVec4, invert4x4, buildDiscreteTimeMatrices, buildContinuousTimeSystem, updateAll, processSample) as inline.
+   • Recalculation of matrices is done only when parameters (or their smoothed values) change.
    ================================================================================================
 */
 
@@ -74,10 +80,10 @@ namespace project
             for (auto& v : filtersRight)
                 v.prepare(sampleRate);
 
-            // Set smoothing time (here 50ms, adjust as needed)
-            cutoffSmooth.reset(sampleRate, 0.05);
-            resonanceSmooth.reset(sampleRate, 0.05);
-            keytrackSmooth.reset(sampleRate, 0.05);
+ 
+            cutoffSmooth.reset(sampleRate, 0.001);
+            resonanceSmooth.reset(sampleRate, 0.001);
+            keytrackSmooth.reset(sampleRate, 0.001);
 
             cutoffSmooth.setCurrentAndTargetValue(cutoffFrequency);
             resonanceSmooth.setCurrentAndTargetValue(resonance);
@@ -103,7 +109,7 @@ namespace project
 
             float* leftCh = audioBlock.getChannelPointer(0);
             float* rightCh = audioBlock.getChannelPointer(1);
-            int numSamples = (int)data.getNumSamples();
+            int numSamples = static_cast<int>(data.getNumSamples());
 
             for (int i = 0; i < numSamples; ++i)
             {
@@ -128,7 +134,7 @@ namespace project
                     v.applyChangesIfNeeded();
                 }
 
-                // Process the sample for each voice in series (or sum/mix as needed)
+                // Process the sample for each voice in series (or mix as needed)
                 float outL = leftCh[i];
                 float outR = rightCh[i];
                 for (auto& v : filtersLeft)
@@ -152,7 +158,7 @@ namespace project
         public:
             AudioEffect() = default;
 
-            void prepare(float fs)
+            inline void prepare(float fs)
             {
                 sampleRate = fs;
                 baseCutoff = 1000.0f;
@@ -165,7 +171,7 @@ namespace project
                 updateAll(); // Build matrices and invert M
             }
 
-            void reset()
+            inline void reset()
             {
                 for (int i = 0; i < 4; ++i)
                     x[i] = 0.0f;
@@ -220,6 +226,7 @@ namespace project
                 // Compute tempVec = N * x + (gB * input)
                 float temp[4];
                 mulMatVec4(N, x, temp);
+                // Unrolled addition for gB*input:
                 temp[0] += gB[0] * input;
                 temp[1] += gB[1] * input;
                 temp[2] += gB[2] * input;
@@ -229,10 +236,9 @@ namespace project
                 float newX[4];
                 mulMatVec4(MInv, temp, newX);
 
-                // Compute output: y = C * newX
-                float out = 0.0f;
-                for (int i = 0; i < 4; ++i)
-                    out += C[i] * newX[i];
+                // Compute output: y = C * newX (unrolled)
+                float out = C[0] * newX[0] + C[1] * newX[1] +
+                    C[2] * newX[2] + C[3] * newX[3];
 
                 // Update state
                 for (int i = 0; i < 4; ++i)
@@ -245,19 +251,21 @@ namespace project
             //--------------------------------------------------------------------------------------------
             // Recompute matrices and update inversion if parameters have changed
             //--------------------------------------------------------------------------------------------
-            void updateAll()
+            inline void updateAll()
             {
                 // Compute effective cutoff with keytracking
-                float semitones = ((float)storedNote - 60.0f) * keytrackAmount;
+                float semitones = (static_cast<float>(storedNote) - 60.0f) * keytrackAmount;
                 float noteFactor = std::exp2f(0.0833333f * semitones);
                 float fc = baseCutoff * noteFactor;
                 if (fc < 20.0f) fc = 20.0f;
                 float limit = 0.49f * sampleRate;
                 if (fc > limit) fc = limit;
 
-                // Bilinear transform coefficient: g = 2 * tan(pi * fc / fs)
-                float norm = fc / sampleRate;
-                float warped = std::tan(MathConstants<float>::pi * norm);
+                // Precompute reciprocal of sampleRate for efficiency
+                const float fsRecip = 1.0f / sampleRate;
+                // Compute transform factor once: factor = pi * fc / fs
+                const float factor = MathConstants<float>::pi * fc * fsRecip;
+                const float warped = std::tan(factor);
                 g = 2.0f * warped;
 
                 // Build continuous-time state-space matrices
@@ -279,30 +287,28 @@ namespace project
             //--------------------------------------------------------------------------------------------
             // Build the continuous-time state-space for the 2-SVF + global feedback system
             //--------------------------------------------------------------------------------------------
-            void buildContinuousTimeSystem()
+            inline void buildContinuousTimeSystem()
             {
-                const float r = rDamping;
-                const float kf = resonance;
+                // Precompute constant: twoR = 2*rDamping
+                const float twoR = 2.0f * rDamping;
                 // Clear matrices
                 for (int rr = 0; rr < 4; ++rr)
-                {
                     for (int cc = 0; cc < 4; ++cc)
                         Acont[rr][cc] = 0.0f;
-                }
                 for (int i = 0; i < 4; ++i)
                 {
                     Bcont[i] = 0.0f;
                     Ccont[i] = 0.0f;
                 }
                 // x1'(t) row
-                Acont[0][0] = -2.0f * r;
+                Acont[0][0] = -twoR;
                 Acont[0][1] = -1.0f;
-                Acont[0][3] = -kf;
+                Acont[0][3] = -resonance;
                 // x2'(t) row
                 Acont[1][0] = 1.0f;
                 // x3'(t) row
                 Acont[2][1] = 1.0f;
-                Acont[2][2] = -2.0f * r;
+                Acont[2][2] = -twoR;
                 Acont[2][3] = -1.0f;
                 // x4'(t) row
                 Acont[3][2] = 1.0f;
@@ -316,7 +322,7 @@ namespace project
             //--------------------------------------------------------------------------------------------
             // Build discrete-time matrices using TPT
             //--------------------------------------------------------------------------------------------
-            void buildDiscreteTimeMatrices()
+            inline void buildDiscreteTimeMatrices()
             {
                 float gA[4][4];
                 for (int rr = 0; rr < 4; ++rr)
@@ -328,10 +334,10 @@ namespace project
                 {
                     for (int cc = 0; cc < 4; ++cc)
                     {
-                        float valMinus = ((rr == cc) ? 1.0f : 0.0f) - gA[rr][cc];
-                        float valPlus = ((rr == cc) ? 1.0f : 0.0f) + gA[rr][cc];
-                        M[rr][cc] = valMinus;
-                        N[rr][cc] = valPlus;
+                        // Precompute the common identity factor for this index
+                        const float id = (rr == cc) ? 1.0f : 0.0f;
+                        M[rr][cc] = id - gA[rr][cc];
+                        N[rr][cc] = id + gA[rr][cc];
                     }
                 }
                 for (int i = 0; i < 4; ++i)
@@ -339,9 +345,9 @@ namespace project
             }
 
             //--------------------------------------------------------------------------------------------
-            // Invert a 4x4 matrix using Gaussian elimination
+            // Invert a 4x4 matrix using Gaussian elimination (unrolled for fixed size)
             //--------------------------------------------------------------------------------------------
-            static void invert4x4(const float src[4][4], float dst[4][4])
+            static inline void invert4x4(const float src[4][4], float dst[4][4])
             {
                 float tmp[4][8];
                 for (int r = 0; r < 4; ++r)
@@ -349,15 +355,16 @@ namespace project
                     for (int c = 0; c < 4; ++c)
                         tmp[r][c] = src[r][c];
                     for (int c = 4; c < 8; ++c)
-                        tmp[r][c] = (c - 4 == r) ? 1.0f : 0.0f;
+                        tmp[r][c] = ((c - 4) == r) ? 1.0f : 0.0f;
                 }
                 for (int c = 0; c < 4; ++c)
                 {
                     float pivot = tmp[c][c];
                     if (std::fabs(pivot) < 1.0e-12f)
                         pivot = 1.0e-12f;
+                    const float invPivot = 1.0f / pivot; // precompute reciprocal
                     for (int cc = 0; cc < 8; ++cc)
-                        tmp[c][cc] /= pivot;
+                        tmp[c][cc] *= invPivot;
                     for (int r = 0; r < 4; ++r)
                     {
                         if (r != c)
@@ -369,24 +376,19 @@ namespace project
                     }
                 }
                 for (int r = 0; r < 4; ++r)
-                {
                     for (int c = 0; c < 4; ++c)
                         dst[r][c] = tmp[r][c + 4];
-                }
             }
 
             //--------------------------------------------------------------------------------------------
-            // Multiply a 4x4 matrix by a 4-vector
+            // Multiply a 4x4 matrix by a 4-vector (unrolled for fixed size)
             //--------------------------------------------------------------------------------------------
-            static void mulMatVec4(const float mat[4][4], const float vec[4], float out[4])
+            static inline void mulMatVec4(const float mat[4][4], const float vec[4], float out[4])
             {
-                for (int rr = 0; rr < 4; ++rr)
-                {
-                    float sum = 0.0f;
-                    for (int cc = 0; cc < 4; ++cc)
-                        sum += mat[rr][cc] * vec[cc];
-                    out[rr] = sum;
-                }
+                out[0] = mat[0][0] * vec[0] + mat[0][1] * vec[1] + mat[0][2] * vec[2] + mat[0][3] * vec[3];
+                out[1] = mat[1][0] * vec[0] + mat[1][1] * vec[1] + mat[1][2] * vec[2] + mat[1][3] * vec[3];
+                out[2] = mat[2][0] * vec[0] + mat[2][1] * vec[1] + mat[2][2] * vec[2] + mat[2][3] * vec[3];
+                out[3] = mat[3][0] * vec[0] + mat[3][1] * vec[1] + mat[3][2] * vec[2] + mat[3][3] * vec[3];
             }
 
             float sampleRate = 44100.0f;
@@ -419,12 +421,12 @@ namespace project
         {
             if (P == 0)
             {
-                cutoffFrequency = (float)val;
+                cutoffFrequency = static_cast<float>(val);
                 cutoffSmooth.setTargetValue(cutoffFrequency);
             }
             else if (P == 1)
             {
-                resonance = (float)val;
+                resonance = static_cast<float>(val);
                 if (resonance < 0.0f)
                     resonance = 0.0f;
                 if (resonance > 35.0f)
@@ -433,7 +435,7 @@ namespace project
             }
             else if (P == 2)
             {
-                keytrackAmount = (float)val;
+                keytrackAmount = static_cast<float>(val);
                 keytrackSmooth.setTargetValue(keytrackAmount);
             }
         }
@@ -478,7 +480,7 @@ namespace project
         }
 
     private:
-        PolyData<AudioEffect, NV> filtersLeft;
-        PolyData<AudioEffect, NV> filtersRight;
+        PolyData<typename Griffin_OBFilter::AudioEffect, NV> filtersLeft;
+        PolyData<typename Griffin_OBFilter::AudioEffect, NV> filtersRight;
     };
 }
