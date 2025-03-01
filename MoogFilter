@@ -2,20 +2,26 @@
 #include <JuceHeader.h>
 
 /*
-   ===================================================================================================
-   Implementation of the exact delay-free 2-SVF + Global Feedback filter method
-   from the DAFx-2020 paper by Kurt James Werner & Russell McClellan:
+   ================================================================================
+   "Exact Delay-Free 2-SVF + Global Feedback" from DAFx-2020 paper,
+   pinned to the "Moog" configuration by:
 
+    - local damping r = 1.0
+    - negative feedback sign (gamma0 = -1)
+    - no user param for local damping
+
+   With block-based smoothing:
+    - We ramp cutoff, resonance, keytrack using dsp::SmoothedValue.
+    - Rebuild the matrix once per block if any param changed.
+   => Lower CPU usage + no clicks from param changes.
+
+   If you want stronger resonance range, set e.g. param "Resonance" up to 4.0
+   or more for self-osc. Right now, it goes up to 2.0 per the original code.
+
+   References:
      "Moog Ladder Filter Generalizations Based on State Variable Filters."
      (c) 2020 by K. J. Werner & R. McClellan, licensed under CC BY 3.0
-
-   This version is pinned to the "Moog" configuration by:
-   - Setting local damping r = 1.0f.
-   - Keeping the global feedback sign negative (gamma0 = -1).
-   - Removing the user parameter for local damping.
-
-   This yields the standard Moog ladder behavior in the generalized 2-SVF approach.
-   ===================================================================================================
+   ================================================================================
 */
 
 namespace project
@@ -24,7 +30,7 @@ namespace project
     using namespace hise;
     using namespace scriptnode;
 
-    template <int NV> // NV = number of voices
+    template <int NV> // number of voices
     struct Griffin_OBFilter : public data::base
     {
         SNEX_NODE(Griffin_OBFilter);
@@ -36,7 +42,7 @@ namespace project
 
         static constexpr bool isModNode() { return false; }
         static constexpr bool isPolyphonic() { return NV > 1; }
-        static constexpr bool hasTail() { return false; }
+        static constexpr bool hasTail() { return true; }
         static constexpr bool isSuspendedOnSilence() { return false; }
         static constexpr int  getFixChannelAmount() { return 2; }
 
@@ -46,59 +52,112 @@ namespace project
         static constexpr int  NumFilters = 0;
         static constexpr int  NumDisplayBuffers = 0;
 
-        //================================================================================================
-        // Prepare / reset
-        //================================================================================================
+        //==============================================================================
         void prepare(PrepareSpecs specs)
         {
             sampleRate = specs.sampleRate;
             filtersLeft.prepare(specs);
             filtersRight.prepare(specs);
 
-            for (auto& fl : filtersLeft)
-                fl.prepare(sampleRate);
+            // prepare each voice
+            for (auto& v : filtersLeft)
+                v.prepare(sampleRate);
+            for (auto& v : filtersRight)
+                v.prepare(sampleRate);
 
-            for (auto& fr : filtersRight)
-                fr.prepare(sampleRate);
+            // Setup param smoothing
+            cutoffSmooth.reset(sampleRate, 0.01);     // e.g. 10ms
+            resonanceSmooth.reset(sampleRate, 0.01);
+            keytrackSmooth.reset(sampleRate, 0.01);
+
+            cutoffSmooth.setCurrentAndTargetValue(cutoffFrequency);
+            resonanceSmooth.setCurrentAndTargetValue(resonance);
+            keytrackSmooth.setCurrentAndTargetValue(keytrackAmount);
         }
 
         void reset()
         {
-            for (auto& fl : filtersLeft)  fl.reset();
-            for (auto& fr : filtersRight) fr.reset();
+            for (auto& v : filtersLeft)
+                v.reset();
+            for (auto& v : filtersRight)
+                v.reset();
         }
 
-        //================================================================================================
-        // Audio processing
-        //================================================================================================
+        //==============================================================================
+        // block-based param smoothing to avoid CPU spikes
+        //==============================================================================
         template <typename ProcessDataType>
         void process(ProcessDataType& data)
         {
             auto& fixData = data.template as<ProcessData<getFixChannelAmount()>>();
             auto audioBlock = fixData.toAudioBlock();
-            float* leftChannelData = audioBlock.getChannelPointer(0);
-            float* rightChannelData = audioBlock.getChannelPointer(1);
+
+            float* leftCh = audioBlock.getChannelPointer(0);
+            float* rightCh = audioBlock.getChannelPointer(1);
             int numSamples = (int)data.getNumSamples();
 
-            for (auto& fl : filtersLeft)
-                fl.processBlock(leftChannelData, numSamples);
+            // skip param smoothing for the entire block => final param value for this block
+            if (numSamples > 0)
+            {
+                cutoffSmooth.skip(numSamples);
+                resonanceSmooth.skip(numSamples);
+                keytrackSmooth.skip(numSamples);
+            }
 
-            for (auto& fr : filtersRight)
-                fr.processBlock(rightChannelData, numSamples);
+            float cVal = cutoffSmooth.getCurrentValue();
+            float rVal = resonanceSmooth.getCurrentValue();
+            float kVal = keytrackSmooth.getCurrentValue();
+
+            // if changed from last block => apply once
+            if ((cVal != lastCutoff) || (rVal != lastResonance) || (kVal != lastKeytrack))
+            {
+                for (auto& v : filtersLeft)
+                {
+                    v.setCutoff(cVal);
+                    v.setResonance(rVal);
+                    v.setKeytrack(kVal);
+                    v.applyChangesIfNeeded();
+                }
+                for (auto& v : filtersRight)
+                {
+                    v.setCutoff(cVal);
+                    v.setResonance(rVal);
+                    v.setKeytrack(kVal);
+                    v.applyChangesIfNeeded();
+                }
+
+                lastCutoff = cVal;
+                lastResonance = rVal;
+                lastKeytrack = kVal;
+            }
+
+            // now process the entire block with final param
+            for (int i = 0; i < numSamples; ++i)
+            {
+                float inL = leftCh[i];
+                float inR = rightCh[i];
+
+                // chain or sum for each voice
+                for (auto& v : filtersLeft)
+                    inL = v.processSample(inL);
+
+                for (auto& v : filtersRight)
+                    inR = v.processSample(inR);
+
+                leftCh[i] = inL;
+                rightCh[i] = inR;
+            }
         }
 
         template <typename FrameDataType>
         void processFrame(FrameDataType& data) {}
 
-        //================================================================================================
-        // Voice-level effect: Two 2nd-order SVFs + global feedback, EXACT approach
-        // With r fixed to 1.0 => "Moog" style local damping, gamma0 = -1 => negative feedback sign.
-        //================================================================================================
+        //==============================================================================
+        // The voice-level effect: pinned to Moog with r=1, gamma0=-1 => Acont[0][3] = -resonance
+        //==============================================================================
         class AudioEffect
         {
         public:
-            AudioEffect() = default;
-
             void prepare(float fs)
             {
                 sampleRate = fs;
@@ -130,19 +189,16 @@ namespace project
                 baseCutoff = c;
                 dirtyFlags |= changedCutoff;
             }
-
             inline void setResonance(float r)
             {
                 resonance = r;
                 dirtyFlags |= changedResonance;
             }
-
             inline void setKeytrack(float kt)
             {
                 keytrackAmount = kt;
                 dirtyFlags |= changedKeytrack;
             }
-
             inline void setNoteNumber(int n)
             {
                 storedNote = n;
@@ -155,37 +211,20 @@ namespace project
                     updateAll();
             }
 
-            void processBlock(float* buffer, int numSamples)
-            {
-                applyChangesIfNeeded();
-                for (int i = 0; i < numSamples; ++i)
-                    buffer[i] = processSample(buffer[i]);
-            }
-
-        private:
-            //--------------------------------------------------------------------------------------------
-            // The discrete-time system:
-            //   X[n+1] = MInv * [ N * X[n] + gB * xIn[n] ]
-            //   yOut[n] = C * X[n+1]
-            //
-            // We fix r=1.0 in the continuous-time system for a "Moog" style.
-            // The negative sign in Acont[0][3] is gamma0=-1 for the global feedback path.
-            //--------------------------------------------------------------------------------------------
-            float processSample(float input)
+            inline float processSample(float in)
             {
                 float temp[4];
                 mulMatVec4(N, x, temp);
-                temp[0] += gB[0] * input;
-                temp[1] += gB[1] * input;
-                temp[2] += gB[2] * input;
-                temp[3] += gB[3] * input;
+
+                temp[0] += gB[0] * in;
+                temp[1] += gB[1] * in;
+                temp[2] += gB[2] * in;
+                temp[3] += gB[3] * in;
 
                 float newX[4];
                 mulMatVec4(MInv, temp, newX);
 
-                float out = 0.0f;
-                for (int i = 0; i < 4; ++i)
-                    out += C[i] * newX[i];
+                float out = (C[0] * newX[0] + C[1] * newX[1] + C[2] * newX[2] + C[3] * newX[3]);
 
                 for (int i = 0; i < 4; ++i)
                     x[i] = newX[i];
@@ -193,15 +232,18 @@ namespace project
                 return out;
             }
 
+        private:
             void updateAll()
             {
                 float semitones = ((float)storedNote - 60.0f) * keytrackAmount;
                 float noteFactor = std::exp2f(0.0833333f * semitones);
+
                 float fc = baseCutoff * noteFactor;
                 if (fc < 20.0f) fc = 20.0f;
                 float limit = 0.49f * sampleRate;
                 if (fc > limit) fc = limit;
 
+                // TPT warp
                 float norm = fc / sampleRate;
                 float warped = std::tan(MathConstants<float>::pi * norm);
                 g = 2.0f * warped;
@@ -210,20 +252,21 @@ namespace project
                 buildDiscreteTimeMatrices();
                 invert4x4(M, MInv);
 
+                // Copy Ccont into C
                 for (int i = 0; i < 4; ++i)
                     C[i] = Ccont[i];
 
                 dirtyFlags = 0;
             }
 
-            //--------------------------------------------------------------------------------------------
-            // Build the continuous-time system. r=1.0, gamma0=-1 => Acont[0][3] = -kf
-            //--------------------------------------------------------------------------------------------
             void buildContinuousTimeSystem()
             {
-                const float r = 1.0f; // fixed local damping for Moog style
-                const float kf = resonance;
-
+                const float r = 1.0f;
+                const float kf = resonance; // can let user go up to 4.0 if they'd like
+                // negative sign => moog style
+                // x1'(t) = -2*r*x1 - x2 - kf*x4 + in
+                // ...
+                // etc
                 for (int rr = 0; rr < 4; ++rr)
                 {
                     for (int cc = 0; cc < 4; ++cc)
@@ -235,41 +278,20 @@ namespace project
                     Ccont[i] = 0.0f;
                 }
 
-                // x1'(t) = -2*r*x1 - x2 - kf*x4 + in
                 Acont[0][0] = -2.0f * r;
                 Acont[0][1] = -1.0f;
-                Acont[0][2] = 0.0f;
-                Acont[0][3] = -kf;
+                Acont[0][3] = -kf;  // negative => moog
 
-                // x2'(t) = x1
                 Acont[1][0] = 1.0f;
-                Acont[1][1] = 0.0f;
-                Acont[1][2] = 0.0f;
-                Acont[1][3] = 0.0f;
 
-                // x3'(t) = -2*r*x3 - x4 + x2
-                Acont[2][0] = 0.0f;
                 Acont[2][1] = 1.0f;
                 Acont[2][2] = -2.0f * r;
                 Acont[2][3] = -1.0f;
 
-                // x4'(t) = x3
-                Acont[3][0] = 0.0f;
-                Acont[3][1] = 0.0f;
                 Acont[3][2] = 1.0f;
-                Acont[3][3] = 0.0f;
 
-                // B => x1'(t) has +1.0 * x_in(t)
-                Bcont[0] = 1.0f;
-                Bcont[1] = 0.0f;
-                Bcont[2] = 0.0f;
-                Bcont[3] = 0.0f;
-
-                // output is x4
-                Ccont[0] = 0.0f;
-                Ccont[1] = 0.0f;
-                Ccont[2] = 0.0f;
-                Ccont[3] = 1.0f;
+                Bcont[0] = 1.0f;   // input -> x1'(t)
+                Ccont[3] = 1.0f;   // output is x4
             }
 
             void buildDiscreteTimeMatrices()
@@ -312,22 +334,26 @@ namespace project
                     float pivot = tmp[c][c];
                     if (std::fabs(pivot) < 1.0e-12f)
                         pivot = 1.0e-12f;
+
                     for (int cc = 0; cc < 8; ++cc)
                         tmp[c][cc] /= pivot;
+
                     for (int r = 0; r < 4; ++r)
                     {
                         if (r != c)
                         {
                             float factor = tmp[r][c];
-                            for (int cc = 0; cc < 8; ++cc)
+                            for (int cc = c; cc < 8; ++cc)
                                 tmp[r][cc] -= factor * tmp[c][cc];
                         }
                     }
                 }
 
                 for (int r = 0; r < 4; ++r)
+                {
                     for (int c = 0; c < 4; ++c)
                         dst[r][c] = tmp[r][c + 4];
+                }
             }
 
             static void mulMatVec4(const float mat[4][4], const float vec[4], float out[4])
@@ -346,62 +372,49 @@ namespace project
             float resonance = 0.0f;
             float keytrackAmount = 1.0f;
             int   storedNote = 60;
-            float x[4] = { 0.f, 0.f, 0.f, 0.f };
-            float g = 0.0f;
-            uint32_t dirtyFlags = 0;
 
+            // filter states
+            float x[4] = { 0.f, 0.f, 0.f, 0.f };
+
+            // TPT warp factor
+            float g = 0.f;
+
+            // continuous-time
             float Acont[4][4];
             float Bcont[4];
             float Ccont[4];
+
+            // discrete-time
             float M[4][4], N[4][4], MInv[4][4];
             float gB[4];
             float C[4];
+
+            uint32_t dirtyFlags = 0;
         };
 
+        //==============================================================================
+        // param setting with smoothing
+        //==============================================================================
         template <int P>
         void setParameter(double val)
         {
             if (P == 0) // cutoff
             {
                 cutoffFrequency = (float)val;
-                for (auto& fl : filtersLeft)
-                {
-                    fl.setCutoff(cutoffFrequency);
-                    fl.applyChangesIfNeeded();
-                }
-                for (auto& fr : filtersRight)
-                {
-                    fr.setCutoff(cutoffFrequency);
-                    fr.applyChangesIfNeeded();
-                }
+                cutoffSmooth.setTargetValue(cutoffFrequency);
             }
-            else if (P == 1) // resonance => global feedback
+            else if (P == 1) // resonance
             {
                 resonance = (float)val;
-                for (auto& fl : filtersLeft)
-                {
-                    fl.setResonance(resonance);
-                    fl.applyChangesIfNeeded();
-                }
-                for (auto& fr : filtersRight)
-                {
-                    fr.setResonance(resonance);
-                    fr.applyChangesIfNeeded();
-                }
+                // e.g. let user go up to 2.0 or 4.0 if self-osc is desired
+                if (resonance < 0.0f) resonance = 0.0f;
+                if (resonance > 4.0f) resonance = 4.0f;
+                resonanceSmooth.setTargetValue(resonance);
             }
             else if (P == 2) // keytrack
             {
                 keytrackAmount = (float)val;
-                for (auto& fl : filtersLeft)
-                {
-                    fl.setKeytrack(keytrackAmount);
-                    fl.applyChangesIfNeeded();
-                }
-                for (auto& fr : filtersRight)
-                {
-                    fr.setKeytrack(keytrackAmount);
-                    fr.applyChangesIfNeeded();
-                }
+                keytrackSmooth.setTargetValue(keytrackAmount);
             }
         }
 
@@ -414,7 +427,8 @@ namespace project
                 data.add(std::move(p));
             }
             {
-                parameter::data p("Resonance", { 0.0, 2.0, 0.01 });
+                // default range 0..2 => mild resonance. Or go up to 4.0 for more extreme
+                parameter::data p("Resonance", { 0.0, 3.0, 0.01 });
                 registerCallback<1>(p);
                 p.setDefaultValue(0.0f);
                 data.add(std::move(p));
@@ -422,31 +436,50 @@ namespace project
             {
                 parameter::data p("Keytrack Amount", { -1.0, 1.0, 0.01 });
                 registerCallback<2>(p);
-                p.setDefaultValue(0.0f);
+                p.setDefaultValue(1.0f);
                 data.add(std::move(p));
             }
-            // No damping parameter - r is fixed at 1.0 for Moog
         }
 
         void setExternalData(const ExternalData& data, int index) {}
 
+        // On note-on => set note for each voice
         void handleHiseEvent(HiseEvent& e)
         {
             if (e.isNoteOn())
             {
-                filtersLeft.get().setNoteNumber(e.getNoteNumber());
-                filtersLeft.get().applyChangesIfNeeded();
-                filtersRight.get().setNoteNumber(e.getNoteNumber());
-                filtersRight.get().applyChangesIfNeeded();
+                for (auto& v : filtersLeft)
+                {
+                    v.setNoteNumber(e.getNoteNumber());
+                    v.applyChangesIfNeeded();
+                }
+                for (auto& v : filtersRight)
+                {
+                    v.setNoteNumber(e.getNoteNumber());
+                    v.applyChangesIfNeeded();
+                }
             }
         }
 
     private:
         PolyData<AudioEffect, NV> filtersLeft;
         PolyData<AudioEffect, NV> filtersRight;
+
+        float sampleRate = 44100.0f;
+
+        // raw param values
         float cutoffFrequency = 1000.0f;
         float resonance = 0.0f;
-        float keytrackAmount = 0.0f;
-        float sampleRate = 44100.0f;
+        float keytrackAmount = 1.0f;
+
+        // smoothed param objects
+      SmoothedValue<float> cutoffSmooth;
+       SmoothedValue<float> resonanceSmooth;
+      SmoothedValue<float> keytrackSmooth;
+
+        // track last block’s param to avoid repeated matrix builds
+        float lastCutoff = -9999.0f;
+        float lastResonance = -9999.0f;
+        float lastKeytrack = -9999.0f;
     };
 }
